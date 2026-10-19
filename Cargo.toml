@@ -19,3 +19,8 @@ vt100 = "0.18.1"
 # crate: `cargo test` here needs nothing beyond Rust.
 [workspace]
 members = ["ghostty-oracle"]
+
+# Renders command output for the README screenshots (docs/screenshots.nu).
+[[example]]
+name = "term2html"
+required-features = ["render"]

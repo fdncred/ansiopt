@@ -234,7 +234,7 @@ pub fn explain(report: &Report, paint: Paint, all: bool) -> String {
         .collect();
     let _ = writeln!(
         out,
-        "{} {} · {}",
+        "{} {}\n{}",
         paint.bold("ansiopt explain:"),
         summary_line(report),
         summary.join(" · ")
@@ -249,18 +249,31 @@ pub fn explain(report: &Report, paint: Paint, all: bool) -> String {
         out.push_str("(sequences kept as they were are not listed; --all lists them)\n");
     }
     out.push('\n');
+    let rows: Vec<_> = trace
+        .entries
+        .iter()
+        .filter(|e| e.fate != Fate::Text && (all || e.fate != Fate::Kept))
+        .map(|e| {
+            let seq = clip(&visible(&report.input[e.input.clone()]), 26);
+            let meaning = clip(&describe(&token_at(report.input, e.input.clone())), 30);
+            (e, seq, meaning)
+        })
+        .collect();
+    // Columns are as wide as their widest entry, up to the clip width.
+    let seq_w = rows
+        .iter()
+        .map(|r| r.1.chars().count())
+        .fold("sequence".len(), usize::max);
+    let meaning_w = rows
+        .iter()
+        .map(|r| r.2.chars().count())
+        .fold("meaning".len(), usize::max);
     let _ = writeln!(
         out,
-        "{:>8}  {:<26}  {:<30}  what happened",
+        "{:>8}  {:<seq_w$}  {:<meaning_w$}  what happened",
         "offset", "sequence", "meaning"
     );
-    for entry in &trace.entries {
-        if entry.fate == Fate::Text || (!all && entry.fate == Fate::Kept) {
-            continue;
-        }
-        let bytes = &report.input[entry.input.clone()];
-        let seq = clip(&visible(bytes), 26);
-        let meaning = clip(&describe(&token_at(report.input, entry.input.clone())), 30);
+    for (entry, seq, meaning) in &rows {
         let what = fate_text(report, &entry.fate, true);
         let what = match entry.fate {
             Fate::Superseded { .. } | Fate::NoEffect { .. } => paint.red(&what),
@@ -269,9 +282,10 @@ pub fn explain(report: &Report, paint: Paint, all: bool) -> String {
         };
         let _ = writeln!(
             out,
-            "{:>8}  {seq:<26}  {}  {what}",
+            "{:>8}  {}  {}  {what}",
             entry.input.start,
-            pad(&paint.dim(&meaning), meaning.chars().count(), 30)
+            pad(seq, seq.chars().count(), seq_w),
+            pad(&paint.dim(meaning), meaning.chars().count(), meaning_w)
         );
     }
     out

@@ -6,6 +6,25 @@ movement, modes, OSC (titles, hyperlinks, anything else), DCS/APC/PM/SOS
 strings, character sets and plain ESC sequences. Anything it doesn't model
 passes through byte for byte.
 
+```nu
+"\e[0m\e[1m\e[31mhi\e[0m\e[0m\n" | ansiopt --show
+# => \e[;1;31mhi\e[m\n
+"\e[0m\e[1m\e[31mhi\e[0m\e[0m\n" | ansiopt -s | ignore
+# => ansiopt: 24 -> 14 bytes (10 saved, 41.7%)
+```
+
+Two resets in a row are one reset, and three SGR sequences before `hi` are
+one. On real captures that kind of repetition adds up: bat's output shrinks
+by a third.
+
+## Install
+
+```nu
+cargo install --path .
+```
+
+## Usage
+
 ```
 ansiopt [OPTIONS] [FILE]          # reads stdin when FILE is missing
 
@@ -26,102 +45,190 @@ views (printed instead of the result unless -o is given):
       --hotspot         the text shaded by escape bytes spent on it
       --all             in --diff and --explain, show everything
       --html <FILE>     an HTML report combining all of them
-      --color <WHEN>    auto, always or never
+      --color <WHEN>    auto, always or never (auto respects NO_COLOR)
       --width <N>       columns for the HTML preview
       --height <N>      rows for the HTML preview
 ```
 
-As a library:
-
-```rust
-let out = ansiopt::minify(b"\x1b[0m\x1b[1m\x1b[31mhi\x1b[0m\x1b[0m", &Default::default());
-assert_eq!(out, b"\x1b[;1;31mhi\x1b[m");
-```
-
-The HTML report's rendered preview uses the `vt100` crate through the
-default `render` feature. Library users who only need minification can turn
-it off with `default-features = false`.
-
-`Minifier` is the streaming form. Call `feed` for each chunk, `flush` when the
-producer may pause, and `finish` at the end. Two things only `minify` does.
-It falls back to the input if the output would be longer. And visual mode's
-self-disable (see below) covers the whole input instead of starting at the
-chunk that triggered it.
+With `-o`, a view prints to stdout and the minified stream goes to the file,
+so `ansiopt --diff -o small.ansi big.ansi` does both at once.
 
 ## Results
 
 Bytes saved on captured output from real tools:
 
-| sample          |   bytes | default | `-r -a` |
-|-----------------|--------:|--------:|--------:|
-| `bat`           | 340,095 |   35.9% |   53.2% |
-| `delta`         |  35,027 |    6.8% |   35.6% |
-| `git log -p`    | 126,235 |    9.3% |   23.8% |
-| `lsd -la`       |  63,006 |   24.9% |   35.4% |
-| `nu` table      |  12,038 |   28.9% |   41.8% |
-| `nvim` screen   |   5,217 |    4.4% |   39.6% |
-| `eza -la`       |  30,867 |    7.9% |   18.8% |
-| `rg`            |  13,776 |   12.7% |   12.7% |
-| `cargo check`   |  28,159 |    6.2% |    6.2% |
-| `git log --graph` | 25,563 |  0.9% |    0.9% |
+| sample            |   bytes | default | `-r -a` |
+|-------------------|--------:|--------:|--------:|
+| `bat`             | 340,095 |   35.9% |   53.2% |
+| `delta`           |  35,027 |    6.8% |   35.6% |
+| `git log -p`      | 126,235 |    9.3% |   23.8% |
+| `lsd -la`         |  63,006 |   24.9% |   35.4% |
+| `nu` table        |  12,038 |   28.9% |   41.8% |
+| `nvim` screen     |   5,217 |    4.4% |   39.6% |
+| `eza -la`         |  30,867 |    7.9% |   18.8% |
+| `rg`              |  13,776 |   12.7% |   12.7% |
+| `cargo check`     |  28,159 |    6.2% |    6.2% |
+| `git log --graph` |  25,563 |    0.9% |    0.9% |
 
 Output that already writes one SGR per color change (git's graph, cargo) has
 little to remove. Syntax highlighters and TUIs repeat themselves a lot.
 
 ## Seeing what changed
 
-The views line the input up with the output on their text. The optimizer
-never changes or reorders printed characters, only the escape sequences
-between them, so each stretch between two characters can be compared on
-its own. A byte-level diff would mostly show noise from sequences that were
-merged or moved.
+Four views show what the optimizer did and why. They all line the input up
+with the output on their text: the optimizer never changes or reorders
+printed characters, only the escape sequences between them, so each spot
+between two characters can be compared on its own. A byte-level diff would
+mostly show noise from sequences that were merged or moved.
 
-`--diff` lists every place where the sequences between two pieces of text
-changed, with each sequence decoded. Changes that only spell the same thing
-shorter (`\e[0m` becoming `\e[m`) are counted but hidden unless you pass
-`--all`:
+The screenshots below use the captures in `tests/fixtures`, so you can run
+the same commands.
 
-```
-$ ansiopt --diff tests/fixtures/rg.ansi
-ansiopt diff: 1,015 → 872 bytes (14.1% saved) · 48 of 49 gaps changed
-(25 changes that only spell the same thing shorter, like \e[0m → \e[m, are not shown; --all shows them)
+### `--diff`: what changed at each spot
 
-@@ in 24 · out 20 @@ …:    pub ▸fn …
-- \e[0m \e[1m \e[31m   reset ; bold ; fg red
-+ \e[1;31m             bold · fg red
-```
+![ansiopt --diff on the rg fixture](docs/images/diff.png)
 
-It ends with the most common changes, with numbers generalized so
-`38;5;196` and `38;5;197` group together.
+How to read it:
 
-`--explain` records what the optimizer did with every input sequence:
-folded into a later SGR, merged with neighboring movements, dropped as
-pointless, rewritten shorter, or kept as a barrier, with the reason.
+- The first line gives the size before and after, and how many of the spots
+  between two pieces of text changed.
+- Changes that only spell the same thing shorter, like `\e[0m` becoming
+  `\e[m`, are counted on the second line but not listed. `--all` lists them
+  too.
+- `@@ in 24 · out 20 @@` is where the spot is: byte 24 of the input, byte 20
+  of the output. After it comes the text on either side, with `▸` marking
+  the spot.
+- The red `-` line is what the input had there, and the green `+` line is
+  what ansiopt writes instead. `(nothing)` means it was all dropped. The
+  gray column decodes each sequence: `;` separates sequences, `·` separates
+  the attributes inside one SGR.
+- The table at the end groups the changes, with numbers shown as `N`, and
+  sorts them by bytes saved. Here the top row says that twelve times, a
+  reset plus bold plus red became a single bold-red sequence. The reset was
+  pointless because the colors had already been reset at that point.
 
-```
-$ ansiopt --explain tests/fixtures/rg.ansi
-  offset  sequence                    meaning                         what happened
-       0  \e[0m                       reset                           folded into \e[;32m at 0
-       4  \e[32m                      fg green                        folded into \e[;32m at 0
-```
+### `--explain`: what happened to every sequence
 
-`--hotspot` prints the text with each run shaded by the escape bytes spent
-on it, and per-line totals for input and output. It shows at a glance where
-a program spends its bytes.
+![ansiopt --explain on the vim fixture](docs/images/explain.png)
 
-`--html report.html` writes one self-contained page with tabs for all of
-the above plus:
+Each row is one sequence from the input: its byte offset, the sequence, what
+it means, and what ansiopt did with it. The second line counts every
+outcome. Sequences written unchanged are counted but only listed with
+`--all`. The outcomes:
 
-- a rendered preview of input and output side by side, drawn by `vt100`,
-  with a check that every cell matches. Full-screen programs that leave the
-  alternate screen show their last frame. vt100 is good for checking
-  equivalence, not for screenshots: it has no DEC line drawing,
-  strikethrough or hyperlinks;
-- a breakdown of bytes per kind of content, before and after;
-- hover details on every sequence: what it does and what happened to it.
+| what happened | meaning |
+|---|---|
+| folded into `X` | A color, hyperlink or character set change, written later as part of `X` once text needed it. Several input sequences often fold into one. |
+| merged into `X` | Combined with neighboring cursor movements or mode changes into `X`. |
+| rewritten as `X` | The same sequence, spelled shorter. |
+| no effect | Changed nothing by the time it mattered, like setting the color that was already in use. |
+| dropped | Made pointless by something later: a movement followed by an absolute move, a mode changed again before it mattered, a full reset. |
+| barrier | Copied as is. ansiopt writes all pending state out first and stops assuming what the sequence might change. |
+| kept | Written unchanged. |
 
-Everything from the stream is HTML-escaped, and links in it are never made
+`at N` is the byte offset in the output.
+
+### `--hotspot`: where the bytes go
+
+![ansiopt --hotspot on the bat fixture](docs/images/hotspot.png)
+
+Each run of text is shaded by how many escape bytes the input spent right
+before it, which is usually what it cost to color that run. The key at the
+top gives the scale. The `in` and `out` columns total each line for the
+input and the output, and `⏎` marks bytes spent at the end of a line,
+usually a reset before the line feed. Line feeds themselves aren't counted.
+
+In this bat capture almost every token costs 20 to 40 bytes: bat resets and
+re-sends a 24-bit color before each one, even when the color doesn't change.
+
+### `--html`: a report to share
+
+`ansiopt --html report.html FILE` writes one self-contained page with all of
+the above. The screenshots come from `ansiopt --html report.html
+tests/fixtures/bat.ansi`.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/report-diff-dark.png">
+  <img alt="The Diff tab of the HTML report" src="docs/images/report-diff-light.png">
+</picture>
+
+The tiles at the top summarize the run: bytes in and out, the share saved,
+how many escape sequences there were before and after, and how many spots
+between two pieces of text changed.
+
+The **Diff** tab shows the text as the input draws it, in its own colors.
+At each spot that changed, red struck-through chips are what the input had
+and green chips are what ansiopt writes instead; `∅` means nothing is
+written there. Hover over a chip to see what it does and what happened to
+it. Two checkboxes bring back what's hidden by default: changes that only
+spell the same thing shorter, and sequences that didn't change at all.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/report-rendered-dark.png">
+  <img alt="The Rendered tab of the HTML report" src="docs/images/report-rendered-light.png">
+</picture>
+
+The **Rendered** tab draws the input and the output on the same screen size
+with the `vt100` crate and compares every cell and the cursor. "✓
+Identical" means the two produce the same screen; otherwise the differing
+cells are outlined. The preview guesses the screen size: as wide as the
+longest line and as tall as the output, or, for a full-screen program, the
+size it drew on, showing its last frame before it left the alternate
+screen. `--width` and `--height` override the guess. Line feeds are treated
+as CR LF, the way a terminal's tty delivers program output. This is a check
+that both streams draw the same thing, not a screenshot: vt100 has no DEC
+line-drawing characters, strikethrough, blink or hyperlinks.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/report-breakdown-dark.png">
+  <img alt="The Breakdown tab of the HTML report" src="docs/images/report-breakdown-light.png">
+</picture>
+
+The **Breakdown** tab shows the bytes spent on each kind of content. Each
+row has two dots, input and output (the legend tells them apart), and the
+line between them is what was saved. Text never changes, so its two dots
+sit on top of each other. The table underneath has the exact numbers.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/report-changes-dark.png">
+  <img alt="The Changes tab of the HTML report" src="docs/images/report-changes-light.png">
+</picture>
+
+The **Changes** tab is the table from the end of `--diff`. It can group with
+numbers shown as `N` or by exact bytes. Here the first row is bat's biggest
+waste: 145 times it sent a reset and a 24-bit color that changed nothing,
+and ansiopt wrote nothing in their place.
+
+The **Hotspot** and **Explain** tabs match the terminal views. Hotspot can
+also shade by output bytes or bytes saved, and Explain can filter by
+outcome.
+
+Everything from the stream is HTML-escaped and no link in it is made
 clickable, so a report built from an untrusted capture is safe to open.
+
+To regenerate these screenshots after changing a view, run
+`nu docs/screenshots.nu` (it needs Google Chrome).
+
+## As a library
+
+```rust
+let out = ansiopt::minify(b"\x1b[0m\x1b[1m\x1b[31mhi\x1b[0m\x1b[0m", &Default::default());
+assert_eq!(out, b"\x1b[;1;31mhi\x1b[m");
+```
+
+`minify_detailed` also reports whether ansiopt fell back to the input and,
+when asked, records a trace of what happened to each token. The
+`ansiopt::report` module builds the views from that.
+
+`Minifier` is the streaming form. Call `feed` for each chunk, `flush` when
+the producer may pause, and `finish` at the end. Two things only `minify`
+does. It falls back to the input if the output would be longer. And visual
+mode's self-disable (see below) covers the whole input instead of starting
+at the chunk that triggered it.
+
+The HTML report's rendered preview uses the `vt100` crate through the
+default `render` feature. Library users who only need minification can turn
+it off with `default-features = false`.
 
 ## How it works
 
@@ -253,7 +360,7 @@ The two disagree with each other on bold and faint, VPA in origin mode, what
 erased cells keep, trailing empty parameters and more. That disagreement is
 what makes the pair useful.
 
-```
+```nu
 cargo test --release                                      # vt100, 20k cases per suite
 cargo test --release -p ghostty-oracle                    # vt100 + Ghostty
 ANSIOPT_FUZZ_ITERATIONS=200000 ANSIOPT_FUZZ_SEED=3 cargo test --release -p ghostty-oracle
@@ -284,12 +391,14 @@ Ghostty: `quirks_memset.zig` exports a strong `memset` for shared libraries,
 and `initLibApple` links the dylib from the static archive with `-all_load`,
 which also pulls in compiler-rt's copy.
 
-```
+```nu
 git clone https://github.com/ghostty-org/ghostty ~/src/ghostty-vt
 git -C ~/src/ghostty-vt checkout 3425025e585a3403340d4dc6d65132f42e05e605
 # in build.zig, change `shared.install(b.getInstallStep());` to
 #   if (!config.target.result.os.tag.isDarwin()) shared.install(b.getInstallStep());
-GHOSTTY_SOURCE_DIR=~/src/ghostty-vt cargo test --release -p ghostty-oracle
+with-env {GHOSTTY_SOURCE_DIR: ('~/src/ghostty-vt' | path expand)} {
+    cargo test --release -p ghostty-oracle
+}
 ```
 
 The fuzzer can't see kitty extensions, sixel, or attributes neither emulator

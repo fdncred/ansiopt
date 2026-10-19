@@ -1,0 +1,12 @@
+[0m[32m43[0m:    pub [0m[1m[31mfn [0munchanged(&self, input: &[u8], output: &[u8]) -> bool {
+[0m[32m49[0m:    pub [0m[1m[31mfn [0minput_bytes(&self) -> usize {
+[0m[32m53[0m:    pub [0m[1m[31mfn [0moutput_bytes(&self) -> usize {
+[0m[32m72[0m:    [0m[1m[31mfn [0mfmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+[0m[32m90[0m:[0m[1m[31mfn [0mevents(bytes: &[u8]) -> Vec<Event> {
+[0m[32m128[0m:[0m[1m[31mfn [0mrep_count(c: &lexer::Csi) -> Option<usize> {
+[0m[32m140[0m:pub [0m[1m[31mfn [0malign(input: &[u8], output: &[u8]) -> Result<Alignment, Mismatch> {
+[0m[32m205[0m:pub [0m[1m[31mfn [0mtoken_at(bytes: &[u8], range: Range<usize>) -> Token<'_> {
+[0m[32m216[0m:    [0m[1m[31mfn [0msummary(input: &[u8], output: &[u8]) -> Vec<String> {
+[0m[32m237[0m:    [0m[1m[31mfn [0mpairs_sequences_between_characters() {
+[0m[32m253[0m:    [0m[1m[31mfn [0mexpands_rep() {
+[0m[32m261[0m:    [0m[1m[31mfn [0mreports_mismatches() {

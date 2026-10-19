@@ -1,0 +1,23 @@
+^D[?1006;1000h[?1002h[?1049h[=1;1u[?1h=[?2004h[?1004h[1;24r[?12h[?12l[22;2t[22;1t[27m[23m[29m[m[H[2J[?25l[24;1H"~/src/ansiopt/src/optimizer.rs" 1049L, 37954B[1;1H[35m//! The streaming optimizer.
+//!
+//! The optimizer keeps two copies of the state that escape sequences set up
+//! for later text: `desired`, what the input has asked for so far, and
+//! `emitted`, what the output has actually told the terminal. Sequences that
+//! only change that state are absorbed into `desired`. When something
+//! visible happens (text is printed, the screen is erased, ...) the
+//! attributes it depends on are brought up to date with the shortest
+//! encoding of the difference, then the operation is written.
+//!
+//! Operations whose effect we cannot model act as barriers: everything is
+//! synchronized first, the bytes are copied verbatim, and afterwards the
+//! state they might have touched is marked unknown.[m
+
+[38;5;130muse[m [35mstd[m[35m::[m[35mcollections[m[35m::[mHashMap;
+
+[38;5;130muse[m [35mcrate[m[35m::[mOptions;
+[38;5;130muse[m [35mcrate[m[35m::[m[35mlexer[m[35m::[m{[31mself[m, Csi, Esc, Osc, Scan, StrKind, Terminator, Token};
+[38;5;130muse[m [35mcrate[m[35m::[m[35msgr[m[35m::[m{[31mself[m, Pen};
+
+[35m/// Mask bits beyond the pen fields defined in [`sgr`].[m
+[32mconst[m LINK: [32mu32[m [38;5;130m=[m [31m1[m [38;5;130m<<[m [31m20[m;
+[32mconst[m CHARSET: [32mu32[m [38;5;130m=[m [31m1[m [38;5;130m<<[m [31m21[m;[24;63H1,1[11CTop[?25h[1;1H[24;1H[?1006;1000l[?1002l[?2004l[>4;m[=0;1u[23;2t[23;1t[24;1H[K[24;1H[?1004l[?2004l[?1l>[?1049l[>4;m[=0;1u

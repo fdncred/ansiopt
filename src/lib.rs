@@ -13,9 +13,13 @@
 //! assert_eq!(out, b"\x1b[;1;31mhi\x1b[m");
 //! ```
 
+pub mod align;
+pub mod describe;
 pub mod lexer;
 mod optimizer;
+pub mod report;
 pub mod sgr;
+pub mod trace;
 
 pub use optimizer::Minifier;
 
@@ -55,18 +59,48 @@ impl Default for Options {
     }
 }
 
+/// The result of [`minify_detailed`].
+#[derive(Debug, Clone)]
+pub struct Minified {
+    pub output: Vec<u8>,
+    /// The optimized output would have been longer than the input, so the
+    /// input was returned unchanged.
+    pub fell_back: bool,
+    /// What happened to every input token, when asked for.
+    pub trace: Option<trace::Trace>,
+}
+
 /// Minifies a complete stream.
 ///
 /// The result is never longer than the input; if optimizing would not help,
 /// the input is returned unchanged.
 pub fn minify(input: &[u8], options: &Options) -> Vec<u8> {
-    let mut minifier = Minifier::new(*options);
-    let mut out = minifier.feed(input);
-    out.extend(minifier.finish());
-    if out.len() > input.len() {
-        return input.to_vec();
+    minify_detailed(input, options, false).output
+}
+
+/// [`minify`], also reporting whether it fell back to the input and,
+/// with `trace`, what it did with each token.
+pub fn minify_detailed(input: &[u8], options: &Options, trace: bool) -> Minified {
+    let mut minifier = if trace {
+        Minifier::with_trace(*options)
+    } else {
+        Minifier::new(*options)
+    };
+    let mut output = minifier.feed(input);
+    let (rest, recorded) = minifier.finish_traced();
+    output.extend(rest);
+    if output.len() > input.len() {
+        return Minified {
+            output: input.to_vec(),
+            fell_back: true,
+            trace: trace.then(|| trace::Trace::unchanged(input)),
+        };
     }
-    out
+    Minified {
+        output,
+        fell_back: false,
+        trace: recorded,
+    }
 }
 
 /// [`minify`] for string input. The output of valid UTF-8 input is valid

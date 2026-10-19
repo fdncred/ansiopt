@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Renders input and output for the HTML report's side-by-side preview.
+vt100 = { version = "0.18.1", optional = true }
+
+[features]
+# Library users who only need minification can use `default-features = false`.
+default = ["render"]
+render = ["dep:vt100"]
 
 [dev-dependencies]
 vt100 = "0.18.1"

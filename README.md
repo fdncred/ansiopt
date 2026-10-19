@@ -19,6 +19,16 @@ ansiopt [OPTIONS] [FILE]          # reads stdin when FILE is missing
       --stream          write output as input arrives
   -s, --stats           print sizes to stderr
       --show            print the result with escapes made visible
+
+views (printed instead of the result unless -o is given):
+      --diff            what changed between each piece of text
+      --explain         what happened to every input sequence, and why
+      --hotspot         the text shaded by escape bytes spent on it
+      --all             in --diff and --explain, show everything
+      --html <FILE>     an HTML report combining all of them
+      --color <WHEN>    auto, always or never
+      --width <N>       columns for the HTML preview
+      --height <N>      rows for the HTML preview
 ```
 
 As a library:
@@ -27,6 +37,10 @@ As a library:
 let out = ansiopt::minify(b"\x1b[0m\x1b[1m\x1b[31mhi\x1b[0m\x1b[0m", &Default::default());
 assert_eq!(out, b"\x1b[;1;31mhi\x1b[m");
 ```
+
+The HTML report's rendered preview uses the `vt100` crate through the
+default `render` feature. Library users who only need minification can turn
+it off with `default-features = false`.
 
 `Minifier` is the streaming form. Call `feed` for each chunk, `flush` when the
 producer may pause, and `finish` at the end. Two things only `minify` does.
@@ -53,6 +67,61 @@ Bytes saved on captured output from real tools:
 
 Output that already writes one SGR per color change (git's graph, cargo) has
 little to remove. Syntax highlighters and TUIs repeat themselves a lot.
+
+## Seeing what changed
+
+The views line the input up with the output on their text. The optimizer
+never changes or reorders printed characters, only the escape sequences
+between them, so each stretch between two characters can be compared on
+its own. A byte-level diff would mostly show noise from sequences that were
+merged or moved.
+
+`--diff` lists every place where the sequences between two pieces of text
+changed, with each sequence decoded. Changes that only spell the same thing
+shorter (`\e[0m` becoming `\e[m`) are counted but hidden unless you pass
+`--all`:
+
+```
+$ ansiopt --diff tests/fixtures/rg.ansi
+ansiopt diff: 1,015 → 872 bytes (14.1% saved) · 48 of 49 gaps changed
+(25 changes that only spell the same thing shorter, like \e[0m → \e[m, are not shown; --all shows them)
+
+@@ in 24 · out 20 @@ …:    pub ▸fn …
+- \e[0m \e[1m \e[31m   reset ; bold ; fg red
++ \e[1;31m             bold · fg red
+```
+
+It ends with the most common changes, with numbers generalized so
+`38;5;196` and `38;5;197` group together.
+
+`--explain` records what the optimizer did with every input sequence:
+folded into a later SGR, merged with neighboring movements, dropped as
+pointless, rewritten shorter, or kept as a barrier, with the reason.
+
+```
+$ ansiopt --explain tests/fixtures/rg.ansi
+  offset  sequence                    meaning                         what happened
+       0  \e[0m                       reset                           folded into \e[;32m at 0
+       4  \e[32m                      fg green                        folded into \e[;32m at 0
+```
+
+`--hotspot` prints the text with each run shaded by the escape bytes spent
+on it, and per-line totals for input and output. It shows at a glance where
+a program spends its bytes.
+
+`--html report.html` writes one self-contained page with tabs for all of
+the above plus:
+
+- a rendered preview of input and output side by side, drawn by `vt100`,
+  with a check that every cell matches. Full-screen programs that leave the
+  alternate screen show their last frame. vt100 is good for checking
+  equivalence, not for screenshots: it has no DEC line drawing,
+  strikethrough or hyperlinks;
+- a breakdown of bytes per kind of content, before and after;
+- hover details on every sequence: what it does and what happened to it.
+
+Everything from the stream is HTML-escaped, and links in it are never made
+clickable, so a report built from an untrusted capture is safe to open.
 
 ## How it works
 
@@ -188,10 +257,20 @@ what makes the pair useful.
 cargo test --release                                      # vt100, 20k cases per suite
 cargo test --release -p ghostty-oracle                    # vt100 + Ghostty
 ANSIOPT_FUZZ_ITERATIONS=200000 ANSIOPT_FUZZ_SEED=3 cargo test --release -p ghostty-oracle
-ANSIOPT_CORPUS=dir cargo test --release -p ghostty-oracle corpus -- --ignored
+ANSIOPT_CORPUS=dir cargo test --release -p ghostty-oracle corpus
 ```
 
-The last command checks real captures in `dir` with the same oracles.
+The `corpus` test runs the captures in `tests/fixtures` (bat, rg, a nu
+table with hyperlinks, vim, nvim) through both oracles, or the directory in
+`ANSIOPT_CORPUS` instead. The fixtures were made from this repository's own
+files; the nu table's `file://` links point at `/home/user/ansiopt` rather
+than the machine they were captured on.
+
+`tests/report.rs` checks the views. On random streams, the alignment's
+pieces must rebuild both input and output exactly, tracing must not change
+the output, and every token must end up with exactly one fate. Every fixture
+goes through every view, and the HTML preview must report the two screens
+identical.
 
 `ghostty-oracle` builds Ghostty from source with Zig 0.16, which has to be on
 `PATH`. It depends on libghostty-rs `main` at a pinned revision because the

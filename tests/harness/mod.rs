@@ -86,10 +86,9 @@ macro_rules! suite {
             harness::second_pass_never_grows();
         }
 
-        /// Checks real captured output, e.g. `ANSIOPT_CORPUS=dir cargo test
-        /// --release --test oracle corpus -- --ignored`.
+        /// Checks real captured output: `tests/fixtures`, or the directory
+        /// in `ANSIOPT_CORPUS`.
         #[test]
-        #[ignore]
         fn corpus() {
             harness::corpus($oracles);
         }
@@ -588,10 +587,38 @@ pub fn second_pass_never_grows() {
     }
 }
 
-/// Checks every file in `$ANSIOPT_CORPUS` under several option sets.
+/// The captures in `tests/fixtures`, found from either crate of the
+/// workspace.
+pub fn fixtures() -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let dir = match std::env::var("ANSIOPT_CORPUS") {
+        Ok(dir) => std::path::PathBuf::from(dir),
+        Err(_) => {
+            let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+            [
+                manifest.join("tests/fixtures"),
+                manifest.join("../tests/fixtures"),
+            ]
+            .into_iter()
+            .find(|d| d.is_dir())
+            .expect("tests/fixtures exists")
+        }
+    };
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    files.sort();
+    files
+        .into_iter()
+        .map(|path| {
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect()
+}
+
+/// Checks every capture in [`fixtures`] under several option sets.
 pub fn corpus(oracles: &[&dyn Oracle]) {
-    let dir =
-        std::env::var("ANSIOPT_CORPUS").expect("set ANSIOPT_CORPUS to a directory of captures");
     let configs = [
         ("default", Options::default()),
         (
@@ -617,9 +644,7 @@ pub fn corpus(oracles: &[&dyn Oracle]) {
             },
         ),
     ];
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let path = entry.unwrap().path();
-        let input = std::fs::read(&path).unwrap();
+    for (path, input) in fixtures() {
         for (name, options) in &configs {
             for size in [
                 Size { rows: 24, cols: 80 },

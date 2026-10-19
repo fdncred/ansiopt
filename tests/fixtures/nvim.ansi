@@ -1,0 +1,69 @@
+^D[?1049h[?1h=[H[2J[?2004h[?69$p[?2026$p[?2027$p[?2031$p[?2048$p[?u[c]11;?[5n[?25h]11;?[5n[?25l(B[m[H                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                [1 q[?1002h[?1006h[H[?25h[?25l[?1004h[?25h[?25l(B[m[23B[J[93mE1568: Terminal did not respond to DSR request for 'background' color. Startup m[H(B[m[96m//! The streaming optimizer.(B[m[K
+[96m//!(B[m[K
+[96m//! The optimizer keeps two copies of the state that escape sequences set up(B[m[K
+[96m//! for later text: `desired`, what the input has asked for so far, and(B[m[K
+[96m//! `emitted`, what the output has actually told the terminal. Sequences that(B[m[K
+[96m//! only change that state are absorbed into `desired`. When something(B[m[K
+[96m//! visible happens (text is printed, the screen is erased, ...) the(B[m[K
+[96m//! attributes it depends on are brought up to date with the shortest(B[m[K
+[96m//! encoding of the difference, then the operation is written.(B[m[K
+[96m//!(B[m[K
+[96m//! Operations whose effect we cannot model act as barriers: everything is(B[m[K
+[96m//! synchronized first, the bytes are copied verbatim, and afterwards the(B[m[K
+[96m//! state they might have touched is marked unknown.(B[m[K
+[K
+(B[0;1muse(B[m std::collections::HashMap;[K
+[K
+(B[0;1muse(B[m crate::Options;[K
+(B[0;1muse(B[m crate::lexer::{self, Csi, Esc, Osc, Scan, StrKind, Terminator, Token};[K
+(B[0;1muse(B[m crate::sgr::{self, Pen};[K
+[K
+[96m/// Mask bits beyond the pen fields defined in [`sgr`].(B[m[K
+const LINK: u32 = 1 << 20;[K
+(B[0;7m~/src/ansiopt/src/optimizer.rs                                1,1            Top[2 q[H(B[m[96m//! The streaming optimizer.(B[m[K
+[96m//!(B[m[K
+[96m//! The optimizer keeps two copies of the state that escape sequences set up(B[m[K
+[96m//! for later text: `desired`, what the input has asked for so far, and(B[m[K
+[96m//! `emitted`, what the output has actually told the terminal. Sequences that(B[m[K
+[96m//! only change that state are absorbed into `desired`. When something(B[m[K
+[96m//! visible happens (text is printed, the screen is erased, ...) the(B[m[K
+[96m//! attributes it depends on are brought up to date with the shortest(B[m[K
+[96m//! encoding of the difference, then the operation is written.(B[m[K
+[96m//!(B[m[K
+[96m//! Operations whose effect we cannot model act as barriers: everything is(B[m[K
+[96m//! synchronized first, the bytes are copied verbatim, and afterwards the(B[m[K
+[96m//! state they might have touched is marked unknown.(B[m[K
+[K
+(B[0;1muse(B[m std::collections::HashMap;[K
+[K
+(B[0;1muse(B[m crate::Options;[K
+(B[0;1muse(B[m crate::lexer::{self, Csi, Esc, Osc, Scan, StrKind, Terminator, Token};[K
+(B[0;1muse(B[m crate::sgr::{self, Pen};[K
+[K
+[96m/// Mask bits beyond the pen fields defined in [`sgr`].(B[m[K
+const LINK: u32 = 1 << 20;[K
+(B[0;7m~/src/ansiopt/src/optimizer.rs                                1,1            Top
+(B[m[93mE1568: Terminal did not respond to DSR request for 'background' color. Startup m[H[?25h[?25l[2 q[?1002l[?1006l(B[m[?25h[0 q[?1l>[>4;0m[?2004l[?1004l[c[?25h[?25l[23B[?1049l[?25h

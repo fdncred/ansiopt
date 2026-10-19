@@ -1,0 +1,13 @@
+[39m╭───┬──────────────────┬──────╮[0m
+[39m│[0m [1;32m#[0m [39m│[0m       [1;32mname[0m       [39m│[0m [1;32mtype[0m [39m│[0m
+[39m├───┼──────────────────┼──────┤[0m
+[39m│[0m [1;32m0[0m [39m│[0m [39m[38;5;48m]8;;file:///home/user/ansiopt/src/align.rs\src/align.rs]8;;\[0m[0m     [39m│[0m [39mfile[0m [39m│[0m
+[39m│[0m [1;32m1[0m [39m│[0m [39m[38;5;48m]8;;file:///home/user/ansiopt/src/describe.rs\src/describe.rs]8;;\[0m[0m  [39m│[0m [39mfile[0m [39m│[0m
+[39m│[0m [1;32m2[0m [39m│[0m [39m[38;5;48m]8;;file:///home/user/ansiopt/src/lexer.rs\src/lexer.rs]8;;\[0m[0m     [39m│[0m [39mfile[0m [39m│[0m
+[39m│[0m [1;32m3[0m [39m│[0m [39m[38;5;48m]8;;file:///home/user/ansiopt/src/lib.rs\src/lib.rs]8;;\[0m[0m       [39m│[0m [39mfile[0m [39m│[0m
+[39m│[0m [1;32m4[0m [39m│[0m [39m[38;5;48m]8;;file:///home/user/ansiopt/src/main.rs\src/main.rs]8;;\[0m[0m      [39m│[0m [39mfile[0m [39m│[0m
+[39m│[0m [1;32m5[0m [39m│[0m [39m[38;5;48m]8;;file:///home/user/ansiopt/src/optimizer.rs\src/optimizer.rs]8;;\[0m[0m [39m│[0m [39mfile[0m [39m│[0m
+[39m│[0m [1;32m6[0m [39m│[0m [39m[38;5;81m]8;;file:///home/user/ansiopt/src/report\src/report]8;;\[0m[0m       [39m│[0m [39mdir[0m  [39m│[0m
+[39m│[0m [1;32m7[0m [39m│[0m [39m[38;5;48m]8;;file:///home/user/ansiopt/src/sgr.rs\src/sgr.rs]8;;\[0m[0m       [39m│[0m [39mfile[0m [39m│[0m
+[39m│[0m [1;32m8[0m [39m│[0m [39m[38;5;48m]8;;file:///home/user/ansiopt/src/trace.rs\src/trace.rs]8;;\[0m[0m     [39m│[0m [39mfile[0m [39m│[0m
+[39m╰───┴──────────────────┴──────╯[0m

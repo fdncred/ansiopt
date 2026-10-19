@@ -13,10 +13,12 @@
 //! state they might have touched is marked unknown.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use crate::Options;
 use crate::lexer::{self, Csi, Esc, Osc, Scan, StrKind, Terminator, Token};
 use crate::sgr::{self, Pen};
+use crate::trace::{Entry, Fate, Trace};
 
 /// Mask bits beyond the pen fields defined in [`sgr`].
 const LINK: u32 = 1 << 20;
@@ -209,6 +211,74 @@ impl Move {
     }
 }
 
+/// Deferred changes of one kind of state, waiting to be written.
+#[derive(Debug, Default)]
+struct Deferred {
+    /// Trace entries whose change hasn't been resolved yet.
+    entries: Vec<usize>,
+    /// Output written for this kind of state since the oldest of them.
+    outputs: Vec<Range<usize>>,
+}
+
+/// Records what happens to each token, for `--explain`.
+#[derive(Debug, Default)]
+struct Tracer {
+    entries: Vec<Entry>,
+    /// Input offset of the next token.
+    pos: usize,
+    /// The current token.
+    cur: usize,
+    /// The input so far, to compare tokens with what was written for them.
+    input: Vec<u8>,
+    /// Output bytes already handed back to the caller.
+    out_base: usize,
+    pen: Deferred,
+    link: Deferred,
+    charset: Deferred,
+}
+
+impl Tracer {
+    fn set(&mut self, entry: usize, fate: Fate) {
+        self.entries[entry].fate = fate;
+    }
+
+    fn raw(&self, entry: usize) -> &[u8] {
+        &self.input[self.entries[entry].input.clone()]
+    }
+
+    /// Settles deferred changes: folded into what was written for them, or
+    /// without effect when nothing was.
+    fn resolve(deferred: &mut Deferred, entries: &mut [Entry]) {
+        for &e in &deferred.entries {
+            entries[e].fate = if deferred.outputs.is_empty() {
+                Fate::NoEffect {
+                    why: "changed nothing by the time it mattered",
+                }
+            } else {
+                Fate::Folded {
+                    outputs: deferred.outputs.clone(),
+                }
+            };
+        }
+        deferred.entries.clear();
+        deferred.outputs.clear();
+    }
+
+    fn written(deferred: &mut Deferred, range: Range<usize>) {
+        if !deferred.entries.is_empty() {
+            deferred.outputs.push(range);
+        }
+    }
+
+    fn wipe(deferred: &mut Deferred, entries: &mut [Entry], why: &'static str) {
+        for &e in &deferred.entries {
+            entries[e].fate = Fate::Superseded { why };
+        }
+        deferred.entries.clear();
+        deferred.outputs.clear();
+    }
+}
+
 /// Streaming minifier. Feed it chunks of a stream and concatenate what it
 /// returns.
 pub struct Minifier {
@@ -223,8 +293,11 @@ pub struct Minifier {
     /// What DECSC saved, when we saw it happen.
     saved: Option<State>,
     moves: Vec<Move>,
-    /// Pending changes to [`FLAG_MODES`], in order.
-    modes: Vec<(u32, bool)>,
+    /// The trace entries each pending move came from.
+    move_sources: Vec<Vec<usize>>,
+    /// Pending changes to [`FLAG_MODES`], in order, with the trace entry
+    /// each came from.
+    modes: Vec<(u32, bool, usize)>,
     /// Known values of [`FLAG_MODES`] in the terminal.
     mode_values: HashMap<u32, bool>,
     title: Option<Vec<u8>>,
@@ -248,6 +321,7 @@ pub struct Minifier {
     /// `ESC` closes. The next token is copied verbatim so it still does.
     raw_next: bool,
     max_params: usize,
+    trace: Option<Box<Tracer>>,
 }
 
 impl Minifier {
@@ -266,6 +340,7 @@ impl Minifier {
             emitted: start,
             saved: None,
             moves: Vec::new(),
+            move_sources: Vec::new(),
             modes: Vec::new(),
             mode_values: HashMap::new(),
             title: None,
@@ -277,7 +352,16 @@ impl Minifier {
             base_follows: false,
             raw_next: false,
             max_params: opts.max_params.max(1),
+            trace: None,
         }
+    }
+
+    /// A minifier that also records what it does with every token; see
+    /// [`Minifier::finish_traced`].
+    pub fn with_trace(opts: Options) -> Self {
+        let mut m = Self::new(opts);
+        m.trace = Some(Box::default());
+        m
     }
 
     /// Processes a chunk and returns the output that is ready. State changes
@@ -300,7 +384,15 @@ impl Minifier {
         self.process_all(&tokens);
         self.pending = data[pos..].to_vec();
         self.flush_text();
-        std::mem::take(&mut self.out)
+        self.take_out()
+    }
+
+    fn take_out(&mut self) -> Vec<u8> {
+        let out = std::mem::take(&mut self.out);
+        if let Some(t) = &mut self.trace {
+            t.out_base += out.len();
+        }
+        out
     }
 
     /// Writes all held-back state so the terminal matches the input so far,
@@ -308,14 +400,22 @@ impl Minifier {
     pub fn flush(&mut self) -> Vec<u8> {
         self.barrier();
         self.flush_text();
-        std::mem::take(&mut self.out)
+        self.take_out()
     }
 
     /// Ends the stream, returning the remaining output.
-    pub fn finish(mut self) -> Vec<u8> {
+    pub fn finish(self) -> Vec<u8> {
+        self.finish_traced().0
+    }
+
+    /// Ends the stream, returning the remaining output and, for a minifier
+    /// made with [`Minifier::with_trace`], what happened to every token.
+    pub fn finish_traced(mut self) -> (Vec<u8>, Option<Trace>) {
         let data = std::mem::take(&mut self.pending);
         self.process_all(&lexer::tokenize(&data));
-        self.flush()
+        let out = self.flush();
+        let trace = self.trace.map(|t| Trace { entries: t.entries });
+        (out, trace)
     }
 
     fn process_all(&mut self, tokens: &[Token]) {
@@ -345,6 +445,16 @@ impl Minifier {
         }
         for (&token, follows) in tokens.iter().zip(base_follows) {
             self.base_follows = follows;
+            if let Some(t) = &mut self.trace {
+                let raw = token.raw();
+                t.cur = t.entries.len();
+                t.entries.push(Entry {
+                    input: t.pos..t.pos + raw.len(),
+                    fate: Fate::Pending,
+                });
+                t.pos += raw.len();
+                t.input.extend_from_slice(raw);
+            }
             self.process(token);
         }
     }
@@ -353,9 +463,11 @@ impl Minifier {
         if std::mem::take(&mut self.raw_next) {
             match token {
                 Token::Opaque { raw, open_string } => self.opaque(raw, open_string),
-                Token::Control(b) => self.opaque(&[b], false),
                 token => self.opaque(token.raw(), false),
             }
+            self.fate(Fate::Barrier {
+                why: "ends a string the previous sequence left open",
+            });
             return;
         }
         match token {
@@ -371,9 +483,53 @@ impl Minifier {
 
     // Output plumbing.
 
-    fn write(&mut self, bytes: &[u8]) {
+    /// Writes bytes, returning where they landed in the whole output.
+    fn write(&mut self, bytes: &[u8]) -> Range<usize> {
         self.flush_text();
+        let base = self.trace.as_ref().map_or(0, |t| t.out_base);
+        let start = base + self.out.len();
         self.out.extend_from_slice(bytes);
+        start..start + bytes.len()
+    }
+
+    /// Records the fate of the current token.
+    fn fate(&mut self, fate: Fate) {
+        if let Some(t) = &mut self.trace {
+            let cur = t.cur;
+            t.set(cur, fate);
+        }
+    }
+
+    /// Records that the current token was written at `range` as `bytes`.
+    fn wrote_token(&mut self, range: Range<usize>, bytes: &[u8]) {
+        if let Some(t) = &mut self.trace {
+            let raw = t.raw(t.cur);
+            let fate = if bytes == raw {
+                Fate::Kept
+            } else {
+                let why = if raw.starts_with(b"\x1b]") {
+                    "BEL instead of ESC \\ as terminator"
+                } else {
+                    "default or zero-padded parameters dropped"
+                };
+                Fate::Rewritten { output: range, why }
+            };
+            let cur = t.cur;
+            t.set(cur, fate);
+        }
+    }
+
+    /// Defers the current token's change to the pen, hyperlink or
+    /// character sets.
+    fn defer(&mut self, which: u32) {
+        if let Some(t) = &mut self.trace {
+            let cur = t.cur;
+            match which {
+                LINK => t.link.entries.push(cur),
+                CHARSET => t.charset.entries.push(cur),
+                _ => t.pen.entries.push(cur),
+            }
+        }
     }
 
     fn flush_text(&mut self) {
@@ -395,11 +551,36 @@ impl Minifier {
             return;
         }
         let moves = std::mem::take(&mut self.moves);
+        let sources = std::mem::take(&mut self.move_sources);
         let mut buf = Vec::new();
+        let mut spans = Vec::new();
         for m in &moves {
+            let start = buf.len();
             self.encode_move(m, &mut buf);
+            spans.push(start..buf.len());
         }
-        self.write(&buf);
+        let at = self.write(&buf);
+        if let Some(t) = &mut self.trace {
+            for (span, srcs) in spans.into_iter().zip(sources) {
+                let range = at.start + span.start..at.start + span.end;
+                let bytes = &buf[span];
+                for &src in &srcs {
+                    let fate = if srcs.len() == 1 && t.raw(src) == bytes {
+                        Fate::Kept
+                    } else if srcs.len() == 1 {
+                        Fate::Rewritten {
+                            output: range.clone(),
+                            why: "shorter form of the same movement",
+                        }
+                    } else {
+                        Fate::Merged {
+                            output: range.clone(),
+                        }
+                    };
+                    t.set(src, fate);
+                }
+            }
+        }
     }
 
     /// Brings the attributes in `mask` up to date.
@@ -412,21 +593,41 @@ impl Minifier {
             };
             let (text, state) =
                 sgr::transition(&self.emitted.pen, &self.desired.pen, pen_mask, style);
-            self.write(text.as_bytes());
+            let range = self.write(text.as_bytes());
+            if let Some(t) = &mut self.trace {
+                Tracer::written(&mut t.pen, range);
+            }
             self.emitted.pen = state;
         }
-        if mask & LINK != 0
-            && self.emitted.link != self.desired.link
-            && let Some(link) = self.desired.link.clone()
+        if pen_mask == PEN
+            && let Some(t) = &mut self.trace
         {
-            let mut seq = b"\x1b]8;".to_vec();
-            seq.extend_from_slice(link.as_ref().map_or(b";", |l| &l.spec));
-            seq.extend_from_slice(self.string_terminator());
-            self.write(&seq);
-            self.emitted.link = Some(link);
+            Tracer::resolve(&mut t.pen, &mut t.entries);
         }
-        if mask & CHARSET != 0 && self.emitted.charsets != self.desired.charsets {
-            self.sync_charsets();
+        if mask & LINK != 0 {
+            if self.emitted.link != self.desired.link
+                && let Some(link) = self.desired.link.clone()
+            {
+                let mut seq = b"\x1b]8;".to_vec();
+                seq.extend_from_slice(link.as_ref().map_or(b";", |l| &l.spec));
+                seq.extend_from_slice(self.string_terminator());
+                let range = self.write(&seq);
+                if let Some(t) = &mut self.trace {
+                    Tracer::written(&mut t.link, range);
+                }
+                self.emitted.link = Some(link);
+            }
+            if let Some(t) = &mut self.trace {
+                Tracer::resolve(&mut t.link, &mut t.entries);
+            }
+        }
+        if mask & CHARSET != 0 {
+            if self.emitted.charsets != self.desired.charsets {
+                self.sync_charsets();
+            }
+            if let Some(t) = &mut self.trace {
+                Tracer::resolve(&mut t.charset, &mut t.entries);
+            }
         }
     }
 
@@ -459,7 +660,10 @@ impl Minifier {
                 _ => b"\x1b|",
             });
         }
-        self.write(&seq);
+        let range = self.write(&seq);
+        if let Some(t) = &mut self.trace {
+            Tracer::written(&mut t.charset, range);
+        }
         self.emitted.charsets = desired;
     }
 
@@ -493,19 +697,31 @@ impl Minifier {
         self.write(raw);
         self.forget_all();
         self.raw_next = open_string;
+        self.fate(Fate::Barrier {
+            why: "not something the optimizer models",
+        });
+    }
+
+    /// Copies the current token through as a barrier, giving the reason.
+    fn barrier_token(&mut self, raw: &[u8], why: &'static str) {
+        self.barrier();
+        self.write(raw);
+        self.fate(Fate::Barrier { why });
     }
 
     /// Writes an operation that does not depend on the pen.
     fn neutral(&mut self, raw: &[u8]) {
         self.flush_pending();
-        self.write(raw);
+        let range = self.write(raw);
+        self.wrote_token(range, raw);
     }
 
     /// Writes an operation that makes the attributes in `mask` visible.
     fn consume(&mut self, mask: u32, raw: &[u8]) {
         self.flush_pending();
         self.sync(mask);
-        self.write(raw);
+        let range = self.write(raw);
+        self.wrote_token(range, raw);
     }
 
     fn inverse_involved(&self) -> bool {
@@ -527,6 +743,7 @@ impl Minifier {
     // Tokens.
 
     fn print(&mut self, s: &str) {
+        self.fate(Fate::Text);
         self.flush_pending();
         if !self.opts.visual {
             self.sync(EVERYTHING);
@@ -571,8 +788,14 @@ impl Minifier {
             // the right edge may wrap and scroll.
             b'\t' => self.consume(self.erase_mask(), &[b]),
             b'\n' | 0x0b | 0x0c => self.consume(self.erase_mask(), &[b]),
-            0x0e => self.desired.charsets.gl = Some(1),
-            0x0f => self.desired.charsets.gl = Some(0),
+            0x0e => {
+                self.desired.charsets.gl = Some(1);
+                self.defer(CHARSET);
+            }
+            0x0f => {
+                self.desired.charsets.gl = Some(0);
+                self.defer(CHARSET);
+            }
             // CAN and SUB may print a substitute character.
             0x18 | 0x1a => self.consume(EVERYTHING, &[b]),
             _ => self.neutral(&[b]),
@@ -658,8 +881,7 @@ impl Minifier {
             }
             (None, b"", b'u') if p.is_empty() => {
                 // SCORC: may or may not restore attributes.
-                self.barrier();
-                self.write(c.raw);
+                self.barrier_token(c.raw, "may or may not restore saved attributes");
                 self.desired = State::unknown();
                 self.emitted = State::unknown();
             }
@@ -700,9 +922,12 @@ impl Minifier {
         let mut pen = self.desired.pen;
         if pen.apply(c.params) {
             self.desired.pen = pen;
+            self.defer(PEN);
         } else {
-            self.barrier();
-            self.write(c.raw);
+            self.barrier_token(
+                c.raw,
+                "uses SGR forms terminals disagree on (colons, 21, 58, a trailing ;, ...)",
+            );
             self.desired.pen = Pen::UNKNOWN;
             self.emitted.pen = Pen::UNKNOWN;
         }
@@ -711,8 +936,7 @@ impl Minifier {
     fn soft_reset(&mut self, raw: &[u8]) {
         // DECSTR resets the pen and character sets where implemented; it may
         // also be ignored, so only values equal to the defaults stay known.
-        self.barrier();
-        self.write(raw);
+        self.barrier_token(raw, "soft reset: only certain defaults stay known");
         let mut pen = self.desired.pen;
         pen.merge_uncertain(&Pen::DEFAULT);
         let mut charsets = self.desired.charsets.clone();
@@ -738,11 +962,31 @@ impl Minifier {
         };
         if !modes.is_empty() && modes.iter().all(|m| FLAG_MODES.contains(m)) {
             self.flush_moves_only();
+            let cur = self.trace.as_ref().map_or(0, |t| t.cur);
+            let mut queued = false;
             for m in modes {
-                self.modes.retain(|&(n, _)| n != m);
-                if self.mode_values.get(&m) != Some(&set) {
-                    self.modes.push((m, set));
+                if let Some(t) = &mut self.trace {
+                    for &(n, _, src) in &self.modes {
+                        if n == m {
+                            t.set(
+                                src,
+                                Fate::Superseded {
+                                    why: "changed again before it mattered",
+                                },
+                            );
+                        }
+                    }
                 }
+                self.modes.retain(|&(n, _, _)| n != m);
+                if self.mode_values.get(&m) != Some(&set) {
+                    self.modes.push((m, set, cur));
+                    queued = true;
+                }
+            }
+            if !queued {
+                self.fate(Fate::NoEffect {
+                    why: "the terminal already has these modes",
+                });
             }
             return;
         }
@@ -753,7 +997,14 @@ impl Minifier {
         if !modes.iter().all(quiet) {
             self.sync(EVERYTHING);
         }
-        self.write(c.raw);
+        let range = self.write(c.raw);
+        if modes.iter().any(|&m| matches!(m, 47 | 1047 | 1048 | 1049)) {
+            self.fate(Fate::Barrier {
+                why: "switches screens or saves/restores the cursor",
+            });
+        } else {
+            self.wrote_token(range, c.raw);
+        }
         for &m in &modes {
             if FLAG_MODES.contains(&m) {
                 self.mode_values.insert(m, set);
@@ -796,10 +1047,29 @@ impl Minifier {
                 seq.push(if value { b'h' } else { b'l' });
             }
         }
-        for (m, v) in modes {
+        for &(m, v, _) in &modes {
             self.mode_values.insert(m, v);
         }
-        self.write(&seq);
+        let range = self.write(&seq);
+        if let Some(t) = &mut self.trace {
+            let first = modes[0].2;
+            let single = modes.iter().all(|m| m.2 == first);
+            for &(_, _, src) in &modes {
+                let fate = if single && t.raw(src) == seq.as_slice() {
+                    Fate::Kept
+                } else if single {
+                    Fate::Rewritten {
+                        output: range.clone(),
+                        why: "modes the terminal already had were dropped",
+                    }
+                } else {
+                    Fate::Merged {
+                        output: range.clone(),
+                    }
+                };
+                t.set(src, fate);
+            }
+        }
     }
 
     fn flush_moves_only(&mut self) {
@@ -815,18 +1085,24 @@ impl Minifier {
                 self.saved = Some(self.desired.clone());
             }
             (b"", b'8') => {
-                self.barrier();
-                self.write(e.raw);
+                self.barrier_token(e.raw, "restores the saved cursor and attributes");
                 self.restore_cursor();
             }
             (b"", b'c') => self.full_reset(e.raw),
             (b"", b'D' | b'E' | b'M') => self.consume(self.erase_mask(), e.raw),
             (b"", b'N' | b'O') => self.consume(EVERYTHING, e.raw),
-            (b"", b'n') => self.desired.charsets.gl = Some(2),
-            (b"", b'o') => self.desired.charsets.gl = Some(3),
-            (b"", b'~') => self.desired.charsets.gr = Some(1),
-            (b"", b'}') => self.desired.charsets.gr = Some(2),
-            (b"", b'|') => self.desired.charsets.gr = Some(3),
+            (b"", f @ (b'n' | b'o')) => {
+                self.desired.charsets.gl = Some(if f == b'n' { 2 } else { 3 });
+                self.defer(CHARSET);
+            }
+            (b"", f @ (b'~' | b'}' | b'|')) => {
+                self.desired.charsets.gr = Some(match f {
+                    b'~' => 1,
+                    b'}' => 2,
+                    _ => 3,
+                });
+                self.defer(CHARSET);
+            }
             ([first, rest @ ..], _) if rest.len() <= 1 && b"()*+-./".contains(first) => {
                 let slot = match first {
                     b'(' => 0,
@@ -835,6 +1111,7 @@ impl Minifier {
                     _ => 3,
                 };
                 self.desired.charsets.g[slot] = Some(e.raw.to_vec());
+                self.defer(CHARSET);
             }
             (b"#", b'8') => self.consume(EVERYTHING, e.raw),
             (b"", b'=' | b'>' | b'H' | b'\\' | b'Z')
@@ -871,10 +1148,23 @@ impl Minifier {
 
     fn full_reset(&mut self, raw: &[u8]) {
         // Pending pen changes and movements are wiped by RIS, so drop them.
+        if let Some(t) = &mut self.trace {
+            let why = "wiped by the full reset (RIS) that followed";
+            for &src in self.move_sources.iter().flatten() {
+                t.set(src, Fate::Superseded { why });
+            }
+            for &(_, _, src) in &self.modes {
+                t.set(src, Fate::Superseded { why });
+            }
+            Tracer::wipe(&mut t.pen, &mut t.entries, why);
+            Tracer::wipe(&mut t.charset, &mut t.entries, why);
+        }
         self.moves.clear();
+        self.move_sources.clear();
         self.modes.clear();
         self.sync(LINK);
-        self.write(raw);
+        let range = self.write(raw);
+        self.wrote_token(range, raw);
         let mut state = State::reset();
         state.link = None;
         state.charsets.g[0] = None;
@@ -924,6 +1214,7 @@ impl Minifier {
                         serial,
                     })
                 });
+                self.defer(LINK);
             }
             (b"8", _) => self.opaque(o.raw, false),
             (b"0" | b"1" | b"2", Some(value)) => {
@@ -931,7 +1222,11 @@ impl Minifier {
                 let title = command != b"1";
                 let redundant = (!icon || self.icon.as_deref() == Some(value))
                     && (!title || self.title.as_deref() == Some(value));
-                if !redundant {
+                if redundant {
+                    self.fate(Fate::NoEffect {
+                        why: "the title is already set to this",
+                    });
+                } else {
                     let seq = self.normalized_osc(o);
                     self.neutral(&seq);
                     if icon {
@@ -980,12 +1275,13 @@ impl Minifier {
 
     fn push_move(&mut self, m: Move) {
         self.flush_modes();
+        let cur = self.trace.as_ref().map_or(0, |t| t.cur);
         let origin_off = self.desired.origin == Some(false);
         let lr_off = self.lr_margins == Some(false);
         match m {
             Move::Pos { .. } => {
-                self.moves.clear();
-                self.moves.push(m);
+                self.drop_trailing(|_| true);
+                self.push_tracked(m, cur);
             }
             Move::Cr if origin_off && lr_off => self.push_move(Move::Col { n: 1, fin: b'G' }),
             Move::Cr => {
@@ -996,35 +1292,43 @@ impl Minifier {
                 } else {
                     self.drop_trailing(|m| *m == Move::Cr);
                 }
-                self.moves.push(m);
+                self.push_tracked(m, cur);
             }
             Move::Col { n, .. } => {
                 self.drop_trailing(|m| m.keeps_row(origin_off));
                 match self.moves.last_mut() {
-                    Some(Move::Pos { col, .. }) if origin_off => *col = n,
+                    Some(Move::Pos { col, .. }) if origin_off => {
+                        *col = n;
+                        self.merge_source(cur);
+                    }
                     Some(last @ &mut Move::Row { n: row }) if origin_off => {
                         *last = Move::Pos {
                             row,
                             col: n,
                             fin: b'H',
                         };
+                        self.merge_source(cur);
                     }
-                    _ => self.moves.push(m),
+                    _ => self.push_tracked(m, cur),
                 }
             }
             Move::Row { n } => {
                 self.drop_trailing(Move::keeps_column);
                 match self.moves.last_mut() {
                     // vt100-style terminals ignore origin mode for VPA.
-                    Some(Move::Pos { row, .. }) if origin_off => *row = n,
+                    Some(Move::Pos { row, .. }) if origin_off => {
+                        *row = n;
+                        self.merge_source(cur);
+                    }
                     Some(last @ &mut Move::Col { n: col, .. }) if origin_off => {
                         *last = Move::Pos {
                             row: n,
                             col,
                             fin: b'H',
                         };
+                        self.merge_source(cur);
                     }
-                    _ => self.moves.push(m),
+                    _ => self.push_tracked(m, cur),
                 }
             }
             Move::Rel { dir, n } => {
@@ -1054,17 +1358,43 @@ impl Minifier {
                     }
                     _ => false,
                 };
-                if !merged {
-                    self.moves.push(m);
+                if merged {
+                    self.merge_source(cur);
+                } else {
+                    self.push_tracked(m, cur);
                 }
             }
-            _ => self.moves.push(m),
+            _ => self.push_tracked(m, cur),
         }
     }
 
+    fn push_tracked(&mut self, m: Move, source: usize) {
+        self.moves.push(m);
+        self.move_sources.push(vec![source]);
+    }
+
+    /// Records that the current token was folded into the last move.
+    fn merge_source(&mut self, source: usize) {
+        if let Some(srcs) = self.move_sources.last_mut() {
+            srcs.push(source);
+        }
+    }
+
+    /// Drops trailing moves a new one makes pointless.
     fn drop_trailing(&mut self, pred: impl Fn(&Move) -> bool) {
         while self.moves.last().is_some_and(&pred) {
             self.moves.pop();
+            let srcs = self.move_sources.pop().unwrap_or_default();
+            if let Some(t) = &mut self.trace {
+                for src in srcs {
+                    t.set(
+                        src,
+                        Fate::Superseded {
+                            why: "a later movement makes it pointless",
+                        },
+                    );
+                }
+            }
         }
     }
 

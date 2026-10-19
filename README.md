@@ -406,4 +406,8 @@ implements (fonts, superscript, framed, proportional spacing). The optimizer
 still treats those consistently. Each one is either fully modeled or passed
 through as a barrier.
 
+## License
+
+MIT. See [LICENSE](LICENSE).
+
 [libghostty-vt]: https://github.com/uzaaft/libghostty-rs

@@ -2,6 +2,7 @@
 name = "ghostty-oracle"
 version = "0.0.0"
 edition = "2024"
+license = "MIT"
 publish = false
 description = "Runs ansiopt's differential tests against libghostty-vt as well as vt100"
 

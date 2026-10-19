@@ -2,6 +2,7 @@
 name = "ansiopt"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 # Renders input and output for the HTML report's side-by-side preview.

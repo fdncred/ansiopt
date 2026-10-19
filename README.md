@@ -27,6 +27,10 @@ Or from a checkout, `cargo install --path .`. Adding
 `--no-default-features` builds without the `vt100` dependency, at the cost of
 the HTML report's rendered preview.
 
+You need Rust 1.88 or newer and nothing else, whether you install the binary
+or use the library. Only one test suite in this repository uses Zig, and it
+isn't part of the published crate. See [Testing](#testing).
+
 ## Usage
 
 ```
@@ -373,7 +377,7 @@ what makes the pair useful.
 
 ```nu
 cargo test --release                                      # vt100, 20k cases per suite
-cargo test --release -p ghostty-oracle                    # vt100 + Ghostty
+cargo test --release -p ghostty-oracle                    # vt100 + Ghostty, needs Zig
 ANSIOPT_FUZZ_ITERATIONS=200000 ANSIOPT_FUZZ_SEED=3 cargo test --release -p ghostty-oracle
 ANSIOPT_CORPUS=dir cargo test --release -p ghostty-oracle corpus
 ```
@@ -391,15 +395,20 @@ goes through every view, and the HTML preview must report the two screens
 identical.
 
 `ghostty-oracle` builds Ghostty from source with Zig 0.16, which has to be on
-`PATH`. It depends on libghostty-rs `main` at a pinned revision because the
-crates.io release still needs Zig 0.15.2. On macOS 27 (Xcode 27's `ld`),
-Ghostty's build currently fails while linking its shared library, with a
-duplicate `_memset` between Ghostty's fast `memset` and Zig's compiler-rt.
-Only the static library is needed. As a local workaround until it's fixed
-upstream, point `GHOSTTY_SOURCE_DIR` at a checkout of the pinned Ghostty
-commit with the shared-library install disabled. The real fix belongs in
-Ghostty: `quirks_memset.zig` exports a strong `memset` for shared libraries,
-and `initLibApple` links the dylib from the static archive with `-all_load`,
+`PATH`. It's the only part of the repository that uses Zig, and it isn't
+published. You don't need Zig to depend on ansiopt, to install it, or to run
+plain `cargo test`. Commands that build every workspace member's tests do
+need it, like `cargo test --workspace` and
+`cargo check --workspace --all-targets`. `ghostty-oracle` depends on
+libghostty-rs `main` at a pinned revision because the crates.io release still
+needs Zig 0.15.2. On macOS 27 (Xcode 27's `ld`), Ghostty's build currently
+fails while linking its shared library, with a duplicate `_memset` between
+Ghostty's fast `memset` and Zig's compiler-rt. Only the static library is
+needed. As a local workaround until it's fixed upstream, point
+`GHOSTTY_SOURCE_DIR` at a checkout of the pinned Ghostty commit with the
+shared-library install disabled. The real fix belongs in Ghostty:
+`quirks_memset.zig` exports a strong `memset` for shared libraries, and
+`initLibApple` links the dylib from the static archive with `-all_load`,
 which also pulls in compiler-rt's copy.
 
 ```nu

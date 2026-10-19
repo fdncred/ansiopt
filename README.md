@@ -363,23 +363,24 @@ The differential suite renders `prefix + input + suffix` and
 `prefix + output + suffix` in independent emulators and compares every cell,
 the cursor, the pen, modes and the title. Random prefixes put the terminal in
 an arbitrary state first. Random suffixes check the state the stream leaves
-behind. Failures shrink to a minimal case automatically. The harness is
+behind. Failures in the fuzz tests other than the streaming ones shrink to a
+minimal case automatically. The harness is
 `tests/harness/mod.rs` and runs against two oracles:
 
 - the `vt100` crate, in `tests/oracle.rs`, so plain `cargo test` needs nothing
   but Rust;
-- Ghostty's terminal core through [libghostty-vt], next to vt100, in the
-  `ghostty-oracle` workspace crate.
+- Ghostty's terminal core through [libghostty-vt], next to vt100, in
+  `ghostty-oracle`, a separate project inside this repository.
 
 The two disagree with each other on bold and faint, VPA in origin mode, what
 erased cells keep, trailing empty parameters and more. That disagreement is
 what makes the pair useful.
 
 ```nu
-cargo test --release                                      # vt100, 20k cases per suite
-cargo test --release -p ghostty-oracle                    # vt100 + Ghostty, needs Zig
-ANSIOPT_FUZZ_ITERATIONS=200000 ANSIOPT_FUZZ_SEED=3 cargo test --release -p ghostty-oracle
-ANSIOPT_CORPUS=dir cargo test --release -p ghostty-oracle corpus
+cargo test --release                                            # vt100, 20k cases per fuzz test
+cargo test --release --manifest-path ghostty-oracle/Cargo.toml  # vt100 + Ghostty, needs Zig
+ANSIOPT_FUZZ_ITERATIONS=200000 ANSIOPT_FUZZ_SEED=3 cargo test --release --manifest-path ghostty-oracle/Cargo.toml
+ANSIOPT_CORPUS=dir cargo test --release --manifest-path ghostty-oracle/Cargo.toml corpus
 ```
 
 The `corpus` test runs the captures in `tests/fixtures` (bat, rg, a nu
@@ -394,32 +395,28 @@ the output, and every token must end up with exactly one fate. Every fixture
 goes through every view, and the HTML preview must report the two screens
 identical.
 
-`ghostty-oracle` builds Ghostty from source with Zig 0.16, which has to be on
-`PATH`. It's the only part of the repository that uses Zig, and it isn't
-published. You don't need Zig to depend on ansiopt, to install it, or to run
-plain `cargo test`. Commands that build every workspace member's tests do
-need it, like `cargo test --workspace` and
-`cargo check --workspace --all-targets`. `ghostty-oracle` depends on
-libghostty-rs `main` at a pinned revision because the crates.io release still
-needs Zig 0.15.2. On macOS 27 (Xcode 27's `ld`), Ghostty's build currently
-fails while linking its shared library, with a duplicate `_memset` between
-Ghostty's fast `memset` and Zig's compiler-rt. Only the static library is
-needed. As a local workaround until it's fixed upstream, point
-`GHOSTTY_SOURCE_DIR` at a checkout of the pinned Ghostty commit with the
-shared-library install disabled. The real fix belongs in Ghostty:
-`quirks_memset.zig` exports a strong `memset` for shared libraries, and
-`initLibApple` links the dylib from the static archive with `-all_load`,
-which also pulls in compiler-rt's copy.
+`ghostty-oracle` builds Ghostty from source, so it needs Rust 1.90 and Zig
+0.16 on `PATH`. It depends on libghostty-rs `master` at a pinned revision
+because the crates.io release still needs Zig 0.15.2. It isn't a member of
+the root workspace, so nothing run from the repository root builds it,
+fetches its git dependency or calls Zig.
+
+On macOS, Ghostty's build fails at link time with a duplicate `_memset` when
+uutils coreutils' `sort` and `comm` come before Apple's on `PATH`. Ghostty's
+`src/build/libsystem_override.sh` uses them to pick which of compiler-rt's
+libc symbols to hide in favor of libSystem's. In a UTF-8 locale, uutils makes
+the script hide `___memset` instead of `_memset`, which leaves compiler-rt's
+`_memset` next to Ghostty's own. Building with `LC_ALL=C` avoids it. Zig
+caches the script's output without looking at the environment, so if a build
+has already failed, clean it first:
 
 ```nu
-git clone https://github.com/ghostty-org/ghostty ~/src/ghostty-vt
-git -C ~/src/ghostty-vt checkout 3425025e585a3403340d4dc6d65132f42e05e605
-# in build.zig, change `shared.install(b.getInstallStep());` to
-#   if (!config.target.result.os.tag.isDarwin()) shared.install(b.getInstallStep());
-with-env {GHOSTTY_SOURCE_DIR: ('~/src/ghostty-vt' | path expand)} {
-    cargo test --release -p ghostty-oracle
-}
+cargo clean --release -p libghostty-vt-sys --manifest-path ghostty-oracle/Cargo.toml
+LC_ALL=C cargo test --release --manifest-path ghostty-oracle/Cargo.toml
 ```
+
+The real fix belongs in Ghostty: the script should set `LC_ALL=C` before it
+sorts.
 
 The fuzzer can't see kitty extensions, sixel, or attributes neither emulator
 implements (fonts, superscript, framed, proportional spacing). The optimizer

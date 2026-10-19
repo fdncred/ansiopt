@@ -5,7 +5,8 @@
 //! suffix` in every oracle and compares what they observe. Random prefixes
 //! leave the terminal in an arbitrary state, which checks that the optimizer
 //! never assumes anything about the starting state; random suffixes check
-//! that the stream ends in the same state. Failures shrink to a minimal case.
+//! that the stream ends in the same state. A failing `fuzz` case shrinks to a
+//! minimal one.
 
 use std::num::NonZeroU16;
 
@@ -587,8 +588,8 @@ pub fn second_pass_never_grows() {
     }
 }
 
-/// The captures in `tests/fixtures`, found from either crate of the
-/// workspace.
+/// The captures in `tests/fixtures`, found from this crate or from
+/// `ghostty-oracle`.
 pub fn fixtures() -> Vec<(std::path::PathBuf, Vec<u8>)> {
     let dir = match std::env::var("ANSIOPT_CORPUS") {
         Ok(dir) => std::path::PathBuf::from(dir),

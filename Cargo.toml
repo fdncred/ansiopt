@@ -29,10 +29,11 @@ render = ["dep:vt100"]
 [dev-dependencies]
 vt100 = "0.18.1"
 
-# The libghostty-vt oracle builds Ghostty with Zig, so it lives in its own
-# crate: `cargo test` here needs nothing beyond Rust.
+# The libghostty-vt oracle builds Ghostty with Zig, so it is a project of its
+# own rather than a member: nothing run from here builds it or fetches its git
+# dependency.
 [workspace]
-members = ["ghostty-oracle"]
+exclude = ["ghostty-oracle"]
 
 # Renders command output for the README screenshots (docs/screenshots.nu).
 [[example]]

@@ -1,0 +1,13 @@
+[package]
+name = "ghostty-oracle"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Runs ansiopt's differential tests against libghostty-vt as well as vt100"
+
+[dev-dependencies]
+ansiopt = { path = ".." }
+vt100 = "0.18.1"
+# libghostty-rs main: its pinned Ghostty builds with Zig 0.16 (the crates.io
+# release needs Zig 0.15.2).
+libghostty-vt = { git = "https://github.com/uzaaft/libghostty-rs", rev = "0ef80413de1326685743378efbfa06d849e041a7" }

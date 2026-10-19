@@ -1,0 +1,14 @@
+[package]
+name = "ansiopt"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[dev-dependencies]
+vt100 = "0.18.1"
+
+# The libghostty-vt oracle builds Ghostty with Zig, so it lives in its own
+# crate: `cargo test` here needs nothing beyond Rust.
+[workspace]
+members = ["ghostty-oracle"]

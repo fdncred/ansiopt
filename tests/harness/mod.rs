@@ -115,8 +115,8 @@ impl Rng {
         self.below(100) < percent
     }
 
-    pub fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
-        &items[self.below(items.len())]
+    pub fn pick<T: Copy>(&mut self, items: &[T]) -> T {
+        items[self.below(items.len())]
     }
 }
 
@@ -200,12 +200,12 @@ fn gen_token(rng: &mut Rng, out: &mut String) {
                     out.push(';');
                     gen_number(rng, out);
                 }
-                out.push(*rng.pick(&['H', 'f']));
+                out.push(rng.pick(&['H', 'f']));
             }
             _ => {
                 out.push_str("\x1b[");
                 gen_number(rng, out);
-                out.push(*rng.pick(&[
+                out.push(rng.pick(&[
                     'A', 'B', 'C', 'D', 'G', 'd', '`', 'E', 'F', 'a', 'e', 'I', 'Z',
                 ]));
             }
@@ -216,7 +216,7 @@ fn gen_token(rng: &mut Rng, out: &mut String) {
                 out.push('?');
             }
             gen_number(rng, out);
-            out.push(*rng.pick(&['J', 'K', 'X', '@', 'P', 'L', 'M', 'S', 'T', 'b']));
+            out.push(rng.pick(&['J', 'K', 'X', '@', 'P', 'L', 'M', 'S', 'T', 'b']));
         }
         73..=76 => {
             out.push_str(rng.pick(&["\x1b7", "\x1b8", "\x1b[s", "\x1b[u", "\x1b7", "\x1b8"]))
@@ -232,7 +232,7 @@ fn gen_token(rng: &mut Rng, out: &mut String) {
             ));
         }
         83..=87 => {
-            let st = *rng.pick(&["\x07", "\x1b\\"]);
+            let st = rng.pick(&["\x07", "\x1b\\"]);
             match rng.below(5) {
                 0 | 1 => out.push_str(&format!(
                     "\x1b]{};{}{st}",
@@ -483,7 +483,7 @@ pub fn seed(base: u64) -> u64 {
 pub fn fuzz(name: &str, options: Options, base_seed: u64, oracles: &[&dyn Oracle]) {
     let mut rng = Rng(seed(base_seed));
     for iteration in 0..iterations() {
-        let size = *rng.pick(&[
+        let size = rng.pick(&[
             Size { rows: 4, cols: 8 },
             Size { rows: 6, cols: 13 },
             Size { rows: 24, cols: 80 },

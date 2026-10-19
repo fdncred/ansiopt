@@ -2,7 +2,20 @@
 name = "ansiopt"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 license = "MIT"
+description = "Shrinks text containing ANSI escape sequences without changing what a terminal shows"
+repository = "https://github.com/fdncred/ansiopt"
+documentation = "https://docs.rs/ansiopt"
+readme = "README.md"
+keywords = ["ansi", "terminal", "escape", "minify", "sgr"]
+categories = ["command-line-utilities", "text-processing"]
+# The README's screenshots are 2.4 MB; crates.io loads them from the
+# repository instead.
+exclude = ["docs/"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 # Renders input and output for the HTML report's side-by-side preview.

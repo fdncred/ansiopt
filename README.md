@@ -20,8 +20,12 @@ by a third.
 ## Install
 
 ```nu
-cargo install --path .
+cargo install ansiopt
 ```
+
+Or from a checkout, `cargo install --path .`. Adding
+`--no-default-features` builds without the `vt100` dependency, at the cost of
+the HTML report's rendered preview.
 
 ## Usage
 
@@ -210,6 +214,13 @@ To regenerate these screenshots after changing a view, run
 `nu docs/screenshots.nu` (it needs Google Chrome).
 
 ## As a library
+
+```nu
+cargo add ansiopt
+```
+
+A dependency gets only the library; the `ansiopt` binary is built by
+`cargo install`.
 
 ```rust
 let out = ansiopt::minify(b"\x1b[0m\x1b[1m\x1b[31mhi\x1b[0m\x1b[0m", &Default::default());

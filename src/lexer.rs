@@ -133,7 +133,7 @@ pub fn scan(input: &[u8], eof: bool) -> Scan<'_> {
 
 /// Returns every token in `input`, treating its end as the end of the stream.
 pub fn tokenize(input: &[u8]) -> Vec<Token<'_>> {
-    let mut tokens = Vec::new();
+    let mut tokens = Vec::with_capacity(estimate_tokens(input));
     let mut pos = 0;
     while pos < input.len() {
         match scan(&input[pos..], true) {
@@ -145,6 +145,14 @@ pub fn tokenize(input: &[u8]) -> Vec<Token<'_>> {
         }
     }
     tokens
+}
+
+/// A close estimate of how many tokens `input` holds, for sizing vectors
+/// up front instead of letting them grow and copy repeatedly. Text and
+/// controls mostly sit between escape sequences, so it is twice the number
+/// of ESC bytes (counted with SIMD).
+pub(crate) fn estimate_tokens(input: &[u8]) -> usize {
+    2 * memchr::memchr_iter(ESC, input).count() + 1
 }
 
 /// Splits `input` into the raw bytes of each token.
@@ -175,13 +183,69 @@ fn truncated(input: &[u8], eof: bool) -> Scan<'_> {
     }
 }
 
-fn scan_text(input: &[u8], eof: bool) -> Scan<'_> {
-    let end = input
+/// Bytes tested at once by [`find_byte`] and [`text_end`].
+const BLOCK: usize = 16;
+
+/// `position` for the first byte matching `pred`, fast on long inputs:
+/// whole blocks are tested without an early exit, which the compiler turns
+/// into SIMD, and only the block with a match is searched byte by byte.
+fn find_byte(bytes: &[u8], pred: impl Fn(u8) -> bool) -> Option<usize> {
+    let mut offset = 0;
+    // `as_chunks` views the slice as fixed-size arrays plus a remainder.
+    for block in bytes.as_chunks::<BLOCK>().0 {
+        if block.iter().fold(false, |found, &b| found | pred(b)) {
+            break;
+        }
+        offset += BLOCK;
+    }
+    bytes[offset..]
         .iter()
-        .position(|&b| b < 0x20 || b == DEL)
-        .unwrap_or(input.len());
+        .position(|&b| pred(b))
+        .map(|i| offset + i)
+}
+
+/// Offset of the first C0 control or DEL in `input` (or its length), and
+/// whether any byte before it is outside ASCII.
+fn text_end(input: &[u8]) -> (usize, bool) {
+    let is_control = |b: u8| b < 0x20 || b == DEL;
+    // Like `find_byte`, also noting non-ASCII bytes in the same pass.
+    let mut offset = 0;
+    let mut non_ascii = false;
+    for block in input.as_chunks::<BLOCK>().0 {
+        let (control, high) = block.iter().fold((false, false), |(c, h), &b| {
+            (c | is_control(b), h | !b.is_ascii())
+        });
+        if control {
+            break;
+        }
+        non_ascii |= high;
+        offset += BLOCK;
+    }
+    for (i, &b) in input[offset..].iter().enumerate() {
+        if is_control(b) {
+            return (offset + i, non_ascii);
+        }
+        non_ascii |= !b.is_ascii();
+    }
+    (input.len(), non_ascii)
+}
+
+/// Offset of the first C1 code point (C2 80 to C2 9F) in `text`.
+fn find_c1(text: &[u8]) -> Option<usize> {
+    memchr::memchr_iter(0xc2, text)
+        .find(|&i| text.get(i + 1).is_some_and(|b| (0x80..=0x9f).contains(b)))
+}
+
+fn scan_text(input: &[u8], eof: bool) -> Scan<'_> {
+    let (end, non_ascii) = text_end(input);
     let run = &input[..end];
-    let (valid, invalid_len) = match std::str::from_utf8(run) {
+    if !non_ascii {
+        // Printable ASCII is valid UTF-8 without C1 code points.
+        let text = std::str::from_utf8(run).expect("ASCII is UTF-8");
+        return Scan::Token(Token::Text(text), end);
+    }
+    // `compat` reports where validation failed the way `std` does.
+    let (valid, invalid_len) = match simdutf8::compat::from_utf8(run) {
         Ok(s) => (s, 0),
         Err(e) => {
             let valid = std::str::from_utf8(&run[..e.valid_up_to()]).expect("checked by from_utf8");
@@ -197,11 +261,7 @@ fn scan_text(input: &[u8], eof: bool) -> Scan<'_> {
 
     // C1 code points are controls in some terminals; never treat them as text.
     // In UTF-8 they are C2 80 to C2 9F, and C2 never continues a character.
-    let c1 = valid
-        .as_bytes()
-        .windows(2)
-        .position(|pair| pair[0] == 0xc2 && (0x80..=0x9f).contains(&pair[1]));
-    match c1 {
+    match find_c1(valid.as_bytes()) {
         Some(0) => opaque(&input[..2], false),
         Some(i) => Scan::Token(Token::Text(&valid[..i]), i),
         None if valid.is_empty() => opaque(&input[..invalid_len], false),
@@ -274,6 +334,12 @@ fn scan_csi(input: &[u8], eof: bool) -> Scan<'_> {
         i += 1;
     }
     let params_start = i;
+    // Plain parameter bytes are by far the most common; skip them in a tight
+    // loop before handling the rest byte by byte.
+    i += input[i..]
+        .iter()
+        .position(|b| !matches!(b, b'0'..=b';'))
+        .unwrap_or(input.len() - i);
     // Set when the sequence is malformed or has controls embedded in it.
     let mut odd = false;
     let mut intermediates_start = None;
@@ -311,7 +377,11 @@ fn scan_csi(input: &[u8], eof: bool) -> Scan<'_> {
 
 fn scan_osc(input: &[u8], eof: bool) -> Scan<'_> {
     let mut odd = false;
-    for i in 2..input.len() {
+    let mut i = 2;
+    // Every byte that ends or spoils an OSC string is a C0 control, so skip
+    // straight to the next one.
+    while let Some(skip) = find_byte(&input[i..], |b| b < 0x20) {
+        i += skip;
         match input[i] {
             BEL => {
                 let raw = &input[..=i];
@@ -343,9 +413,9 @@ fn scan_osc(input: &[u8], eof: bool) -> Scan<'_> {
             },
             CAN | SUB => return opaque(&input[..=i], false),
             // Terminals ignore other controls inside OSC strings.
-            0x00..=0x1f => odd = true,
-            _ => {}
+            _ => odd = true,
         }
+        i += 1;
     }
     truncated(input, eof)
 }
@@ -354,7 +424,9 @@ fn scan_string(input: &[u8], eof: bool, kind: StrKind) -> Scan<'_> {
     // tmux passthrough doubles every ESC in its payload; only `ESC \` ends it.
     let tmux = kind == StrKind::Dcs && input[2..].starts_with(b"tmux;");
     let mut i = 2;
-    while i < input.len() {
+    // Only these bytes end or cancel the string; skip to the next one.
+    while let Some(skip) = memchr::memchr3(ESC, CAN, SUB, &input[i..]) {
+        i += skip;
         match input[i] {
             ESC => match input.get(i + 1) {
                 Some(b'\\') => {
@@ -365,8 +437,7 @@ fn scan_string(input: &[u8], eof: bool, kind: StrKind) -> Scan<'_> {
                 Some(_) => return opaque(&input[..i], true),
                 None => return truncated(input, eof),
             },
-            CAN | SUB => return opaque(&input[..=i], false),
-            _ => {}
+            _ => return opaque(&input[..=i], false),
         }
         i += 1;
     }
@@ -464,5 +535,49 @@ mod tests {
             ["text:a", "opaque:\u{fffd}:false", "text:b"]
         );
         assert_eq!(scan("é".as_bytes().split_at(1).0, false), Scan::NeedMore);
+    }
+
+    #[test]
+    fn finds_bytes_across_blocks() {
+        let mut bytes = [b'a'; 40];
+        assert_eq!(find_byte(&bytes, |b| b == b'x'), None);
+        for at in [0, 15, 16, 17, 31, 32, 39] {
+            bytes[at] = b'x';
+            assert_eq!(find_byte(&bytes, |b| b == b'x'), Some(at));
+            bytes[at] = b'a';
+        }
+    }
+
+    #[test]
+    fn text_end_notes_non_ascii() {
+        let long = "a".repeat(20);
+        assert_eq!(text_end(long.as_bytes()), (20, false));
+        assert_eq!(text_end(format!("{long}\x1b[m").as_bytes()), (20, false));
+        assert_eq!(text_end(format!("{long}─\n").as_bytes()), (23, true));
+        // A non-ASCII byte after the control does not count.
+        assert_eq!(text_end(format!("{long}\n─").as_bytes()), (20, false));
+    }
+
+    #[test]
+    fn long_strings_skip_to_their_end() {
+        let uri = "file:///home/user/a/long/path/to/some/file.rs";
+        assert_eq!(
+            kinds(format!("\x1b]8;;{uri}\x1b\\x").as_bytes()),
+            [format!("osc:8;;{uri}:St"), "text:x".to_string()]
+        );
+        // A control deep inside makes it opaque; CAN cancels it.
+        let odd = format!("\x1b]0;{uri}\t{uri}\x07");
+        assert_eq!(kinds(odd.as_bytes()).len(), 1);
+        assert!(kinds(odd.as_bytes())[0].starts_with("opaque:"));
+        assert_eq!(kinds(format!("\x1bP{uri}\x18x").as_bytes())[1], "text:x");
+        assert_eq!(kinds(format!("\x1b_G{uri}\x1b\\").as_bytes()), ["str:Apc"]);
+    }
+
+    #[test]
+    fn estimates_tokens_from_escapes() {
+        assert_eq!(estimate_tokens(b"plain"), 1);
+        let input = b"\x1b[1mhi\x1b[m\n";
+        assert_eq!(estimate_tokens(input), 5);
+        assert_eq!(tokenize(input).len(), 4);
     }
 }

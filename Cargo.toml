@@ -1,6 +1,6 @@
 [package]
 name = "ansiopt"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -18,6 +18,10 @@ exclude = ["docs/"]
 all-features = true
 
 [dependencies]
+# SIMD byte search for the lexer's text scanning.
+memchr = "2.8.3"
+# SIMD UTF-8 validation for text outside ASCII.
+simdutf8 = "0.1.5"
 # Renders input and output for the HTML report's side-by-side preview.
 vt100 = { version = "0.18.1", optional = true }
 
@@ -27,6 +31,8 @@ default = ["render"]
 render = ["dep:vt100"]
 
 [dev-dependencies]
+# Runs the benchmarks in benches/.
+criterion = "0.8.2"
 vt100 = "0.18.1"
 
 # The libghostty-vt oracle builds Ghostty with Zig, so it is a project of its
@@ -39,3 +45,7 @@ exclude = ["ghostty-oracle"]
 [[example]]
 name = "term2html"
 required-features = ["render"]
+
+[[bench]]
+name = "minify"
+harness = false

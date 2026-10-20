@@ -12,8 +12,9 @@
 //! synchronized first, the bytes are copied verbatim, and afterwards the
 //! state they might have touched is marked unknown.
 
-use std::collections::HashMap;
+use std::borrow::Cow;
 use std::ops::Range;
+use std::sync::Arc;
 
 use crate::Options;
 use crate::lexer::{self, Csi, Esc, Osc, Scan, StrKind, Terminator, Token};
@@ -62,19 +63,45 @@ type Link = Option<Option<LinkSpec>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LinkSpec {
-    /// The `params;uri` text.
-    spec: Vec<u8>,
     /// Links without an `id` parameter get a new identity from every OSC 8
     /// that opens them (terminals group hover highlighting by identity), so
-    /// each such opening is distinct. Zero for links with an `id`.
+    /// each such opening is distinct. Zero for links with an `id`. Declared
+    /// first so comparisons check it before the text.
     serial: u64,
+    /// The `params;uri` text. Shared rather than copied when the link is
+    /// both desired and emitted (`Arc` is a thread-safe reference-counted
+    /// pointer; cloning it only bumps the count).
+    spec: Arc<[u8]>,
+}
+
+/// A designating sequence: `ESC`, one or two intermediates and the final
+/// byte, stored inline so character set state never allocates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Designation {
+    bytes: [u8; 4],
+    len: u8,
+}
+
+impl Designation {
+    fn new(raw: &[u8]) -> Self {
+        let mut bytes = [0; 4];
+        bytes[..raw.len()].copy_from_slice(raw);
+        Designation {
+            bytes,
+            len: raw.len() as u8,
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
 }
 
 /// G0-G3 designations (kept as the raw designating sequence) and the sets
 /// invoked into GL and GR. `None` is unknown.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Charsets {
-    g: [Option<Vec<u8>>; 4],
+    g: [Option<Designation>; 4],
     gl: Option<u8>,
     gr: Option<u8>,
 }
@@ -89,7 +116,7 @@ impl Charsets {
 
     fn assume_reset() -> Self {
         let mut c = Self::reset();
-        c.g[0] = Some(b"\x1b(B".to_vec());
+        c.g[0] = Some(Designation::new(b"\x1b(B"));
         c
     }
 
@@ -298,8 +325,9 @@ pub struct Minifier {
     /// Pending changes to [`FLAG_MODES`], in order, with the trace entry
     /// each came from.
     modes: Vec<(u32, bool, usize)>,
-    /// Known values of [`FLAG_MODES`] in the terminal.
-    mode_values: HashMap<u32, bool>,
+    /// Known values of [`FLAG_MODES`] in the terminal, by position in that
+    /// list.
+    mode_values: [Option<bool>; FLAG_MODES.len()],
     title: Option<Vec<u8>>,
     icon: Option<Vec<u8>>,
     /// Left/right margin mode (DECLRMM). Unless it is known to be off, CR
@@ -342,7 +370,7 @@ impl Minifier {
             moves: Vec::new(),
             move_sources: Vec::new(),
             modes: Vec::new(),
-            mode_values: HashMap::new(),
+            mode_values: [None; FLAG_MODES.len()],
             title: None,
             icon: None,
             lr_margins: opts.assume_reset.then_some(false),
@@ -368,11 +396,23 @@ impl Minifier {
     /// that nothing has used yet are held back; [`Minifier::flush`] writes
     /// them out.
     pub fn feed(&mut self, input: &[u8]) -> Vec<u8> {
-        self.pending.extend_from_slice(input);
-        let data = std::mem::take(&mut self.pending);
+        // Scan the caller's bytes in place unless a token cut off at the end
+        // of the previous chunk has to be completed first.
+        let mut pending = std::mem::take(&mut self.pending);
+        let data = if pending.is_empty() {
+            input
+        } else {
+            pending.extend_from_slice(input);
+            &pending[..]
+        };
         // The output is rarely longer than the input.
         self.out.reserve(data.len());
-        let mut tokens = Vec::new();
+        // Only visual mode collects the tokens.
+        let mut tokens = if self.opts.visual {
+            Vec::with_capacity(lexer::estimate_tokens(data))
+        } else {
+            Vec::new()
+        };
         let mut pos = 0;
         while pos < data.len() {
             match lexer::scan(&data[pos..], false) {
@@ -391,6 +431,7 @@ impl Minifier {
             }
         }
         self.process_all(&tokens);
+        // Empty in the common case, so this rarely allocates.
         self.pending = data[pos..].to_vec();
         self.flush_text();
         self.take_out()
@@ -421,7 +462,9 @@ impl Minifier {
     /// made with [`Minifier::with_trace`], what happened to every token.
     pub fn finish_traced(mut self) -> (Vec<u8>, Option<Trace>) {
         let data = std::mem::take(&mut self.pending);
-        self.process_all(&lexer::tokenize(&data));
+        if !data.is_empty() {
+            self.process_all(&lexer::tokenize(&data));
+        }
         let out = self.flush();
         let trace = self.trace.map(|t| Trace { entries: t.entries });
         (out, trace)
@@ -434,7 +477,8 @@ impl Minifier {
         // even the previous character's cell, so stop relaxing for the rest
         // of the stream (all of it, for a single chunk) once any character
         // that might combine shows up.
-        let may_combine = |t: &Token| matches!(t, Token::Text(s) if !s.chars().all(cannot_combine));
+        // Printable ASCII never combines, and checking for it is cheap.
+        let may_combine = |t: &Token| matches!(t, Token::Text(s) if !s.is_ascii() && !s.chars().all(cannot_combine));
         if self.opts.visual && tokens.iter().any(may_combine) {
             self.opts.visual = false;
         }
@@ -553,15 +597,21 @@ impl Minifier {
         }
     }
 
+    /// Queues printed text. Only REP needs to see a whole run of text at
+    /// once; otherwise it goes straight to the output.
+    fn push_text(&mut self, s: &str) {
+        if self.opts.rep {
+            self.text.push_str(s);
+        } else {
+            self.out.extend_from_slice(s.as_bytes());
+        }
+    }
+
     fn flush_text(&mut self) {
         if self.text.is_empty() {
             return;
         }
-        if self.opts.rep {
-            write_with_rep(&self.text, &mut self.out);
-        } else {
-            self.out.extend_from_slice(self.text.as_bytes());
-        }
+        write_with_rep(&self.text, &mut self.out);
         // Clearing keeps the allocation for the next run of text.
         self.text.clear();
     }
@@ -572,20 +622,29 @@ impl Minifier {
         if self.moves.is_empty() {
             return;
         }
-        let moves = std::mem::take(&mut self.moves);
+        let mut moves = std::mem::take(&mut self.moves);
+        let encoding = self.move_encoding();
+        let tracing = self.trace.is_some();
+        // Where each move landed in `out`, only collected when tracing.
+        let (_, spans) = self.write_with(|out| {
+            let mut spans = Vec::new();
+            for m in &moves {
+                let start = out.len();
+                encoding.encode(m, out);
+                if tracing {
+                    spans.push(start..out.len());
+                }
+            }
+            spans
+        });
+        // Clearing keeps the allocation for the next moves.
+        moves.clear();
+        self.moves = moves;
         let sources = std::mem::take(&mut self.move_sources);
-        let mut buf = Vec::new();
-        let mut spans = Vec::new();
-        for m in &moves {
-            let start = buf.len();
-            self.encode_move(m, &mut buf);
-            spans.push(start..buf.len());
-        }
-        let at = self.write(&buf);
         if let Some(t) = &mut self.trace {
             for (span, srcs) in spans.into_iter().zip(sources) {
-                let range = at.start + span.start..at.start + span.end;
-                let bytes = &buf[span];
+                let range = t.out_base + span.start..t.out_base + span.end;
+                let bytes = &self.out[span];
                 for &src in &srcs {
                     let fate = if srcs.len() == 1 && t.raw(src) == bytes {
                         Fate::Kept
@@ -630,10 +689,12 @@ impl Minifier {
             if self.emitted.link != self.desired.link
                 && let Some(link) = self.desired.link.clone()
             {
-                let mut seq = b"\x1b]8;".to_vec();
-                seq.extend_from_slice(link.as_ref().map_or(b";", |l| &l.spec));
-                seq.extend_from_slice(self.string_terminator());
-                let range = self.write(&seq);
+                let terminator = self.string_terminator();
+                let (range, ()) = self.write_with(|out| {
+                    out.extend_from_slice(b"\x1b]8;");
+                    out.extend_from_slice(link.as_ref().map_or(b";", |l| &l.spec));
+                    out.extend_from_slice(terminator);
+                });
                 if let Some(t) = &mut self.trace {
                     Tracer::written(&mut t.link, range);
                 }
@@ -654,35 +715,35 @@ impl Minifier {
     }
 
     fn sync_charsets(&mut self) {
-        let desired = self.desired.charsets.clone();
-        let mut seq = Vec::new();
-        for (slot, want) in desired.g.iter().enumerate() {
-            if let Some(raw) = want
-                && self.emitted.charsets.g[slot].as_ref() != Some(raw)
-            {
-                seq.extend_from_slice(raw);
+        let (desired, emitted) = (self.desired.charsets, self.emitted.charsets);
+        let (range, ()) = self.write_with(|out| {
+            for (want, have) in desired.g.iter().zip(&emitted.g) {
+                if let Some(raw) = want
+                    && have != want
+                {
+                    out.extend_from_slice(raw.as_bytes());
+                }
             }
-        }
-        if let Some(gl) = desired.gl
-            && self.emitted.charsets.gl != Some(gl)
-        {
-            seq.extend_from_slice(match gl {
-                0 => b"\x0f",
-                1 => b"\x0e",
-                2 => b"\x1bn",
-                _ => b"\x1bo",
-            });
-        }
-        if let Some(gr) = desired.gr
-            && self.emitted.charsets.gr != Some(gr)
-        {
-            seq.extend_from_slice(match gr {
-                1 => b"\x1b~",
-                2 => b"\x1b}",
-                _ => b"\x1b|",
-            });
-        }
-        let range = self.write(&seq);
+            if let Some(gl) = desired.gl
+                && emitted.gl != Some(gl)
+            {
+                out.extend_from_slice(match gl {
+                    0 => b"\x0f",
+                    1 => b"\x0e",
+                    2 => b"\x1bn",
+                    _ => b"\x1bo",
+                });
+            }
+            if let Some(gr) = desired.gr
+                && emitted.gr != Some(gr)
+            {
+                out.extend_from_slice(match gr {
+                    1 => b"\x1b~",
+                    2 => b"\x1b}",
+                    _ => b"\x1b|",
+                });
+            }
+        });
         if let Some(t) = &mut self.trace {
             Tracer::written(&mut t.charset, range);
         }
@@ -706,7 +767,7 @@ impl Minifier {
         self.desired = State::unknown();
         self.emitted = State::unknown();
         self.saved = None;
-        self.mode_values.clear();
+        self.mode_values = [None; FLAG_MODES.len()];
         self.title = None;
         self.icon = None;
         self.lr_margins = None;
@@ -769,7 +830,7 @@ impl Minifier {
         self.flush_pending();
         if !self.opts.visual {
             self.sync(EVERYTHING);
-            self.text.push_str(s);
+            self.push_text(s);
             return;
         }
         // A space is only blank if what follows cannot be a combining mark
@@ -785,18 +846,24 @@ impl Minifier {
         let mut start = 0;
         while start < s.len() {
             let blank = blank_at(start);
-            let end = s[start..]
-                .char_indices()
-                .map(|(i, _)| start + i)
-                .find(|&i| blank_at(i) != blank)
-                .unwrap_or(s.len());
+            // Only a space can be blank, and a space is a character boundary
+            // (as is whatever follows one), so the boundaries can be found
+            // bytewise.
+            let end = if blank {
+                (start..s.len()).find(|&i| !blank_at(i))
+            } else {
+                memchr::memchr_iter(b' ', &s.as_bytes()[start..])
+                    .map(|i| start + i)
+                    .find(|&i| blank_at(i))
+            }
+            .unwrap_or(s.len());
             let mask = if blank && !self.inverse_involved() {
                 sgr::BLANK_VISIBLE | LINK | CHARSET
             } else {
                 EVERYTHING
             };
             self.sync(mask);
-            self.text.push_str(&s[start..end]);
+            self.push_text(&s[start..end]);
             start = end;
         }
     }
@@ -828,7 +895,7 @@ impl Minifier {
         let p = c.params;
         match (c.private, c.intermediates, c.final_byte) {
             (None, b"", b'm') => self.sgr(c),
-            (None, b"", b'A'..=b'D') => match numbers(p, 1) {
+            (None, b"", b'A'..=b'D') => match numbers::<1>(p) {
                 Some(n) => self.push_move(Move::Rel {
                     dir: c.final_byte,
                     n: at_least_one(&n, 0),
@@ -838,7 +905,7 @@ impl Minifier {
                     axis: Axis::Both,
                 }),
             },
-            (None, b"", fin @ (b'G' | b'`')) => match numbers(p, 1) {
+            (None, b"", fin @ (b'G' | b'`')) => match numbers::<1>(p) {
                 Some(n) => self.push_move(Move::Col {
                     n: at_least_one(&n, 0),
                     fin,
@@ -848,7 +915,7 @@ impl Minifier {
                     axis: Axis::Both,
                 }),
             },
-            (None, b"", b'd') => match numbers(p, 1) {
+            (None, b"", b'd') => match numbers::<1>(p) {
                 Some(n) => self.push_move(Move::Row {
                     n: at_least_one(&n, 0),
                 }),
@@ -857,7 +924,7 @@ impl Minifier {
                     axis: Axis::Column,
                 }),
             },
-            (None, b"", fin @ (b'H' | b'f')) => match numbers(p, 2) {
+            (None, b"", fin @ (b'H' | b'f')) => match numbers::<2>(p) {
                 Some(n) => {
                     let (row, col) = (at_least_one(&n, 0), at_least_one(&n, 1));
                     self.push_move(Move::Pos { row, col, fin });
@@ -883,7 +950,7 @@ impl Minifier {
                 self.consume(self.erase_mask(), &seq);
             }
             (None, b"", b'@' | b'P' | b'L' | b'M' | b'X' | b'S' | b'T')
-                if numbers(p, 1).is_some() =>
+                if numbers::<1>(p).is_some() =>
             {
                 // Only 1 is the default everywhere: Ghostty treats IL 0
                 // and DL 0 as no-ops where xterm treats them as 1.
@@ -908,7 +975,7 @@ impl Minifier {
                 self.emitted = State::unknown();
             }
             (None, b"", b't') => {
-                if numbers(p, 3).is_some_and(|n| n.first() == Some(&23)) {
+                if numbers::<3>(p).is_some_and(|n| n.first() == Some(&23)) {
                     self.title = None;
                     self.icon = None;
                 }
@@ -921,7 +988,7 @@ impl Minifier {
             (None, b"", b'r') => {
                 // DECSTBM. Only "top 1, bottom default" is known to mean the
                 // whole screen; the screen height is unknown.
-                let full = numbers(p, 2).is_some_and(|n| {
+                let full = numbers::<2>(p).is_some_and(|n| {
                     n.first().is_none_or(|&t| t <= 1) && n.get(1).is_none_or(|&b| b == 0)
                 });
                 self.full_region = full.then_some(true);
@@ -939,7 +1006,7 @@ impl Minifier {
     }
 
     fn sgr(&mut self, c: Csi) {
-        let count = c.params.split(|&b| b == b';').count();
+        let count = c.params.iter().filter(|&&b| b == b';').count() + 1;
         self.max_params = self.max_params.max(count);
         let mut pen = self.desired.pen;
         if pen.apply(c.params) {
@@ -961,25 +1028,25 @@ impl Minifier {
         self.barrier_token(raw, "soft reset: only certain defaults stay known");
         let mut pen = self.desired.pen;
         pen.merge_uncertain(&Pen::DEFAULT);
-        let mut charsets = self.desired.charsets.clone();
+        let mut charsets = self.desired.charsets;
         charsets.merge_uncertain(&Charsets::reset());
         // DECSTR also turns origin mode off.
         let origin = self.desired.origin.filter(|&o| !o);
         for state in [&mut self.desired, &mut self.emitted] {
             state.pen = pen;
-            state.charsets = charsets.clone();
+            state.charsets = charsets;
             state.origin = origin;
         }
         self.lr_margins = self.lr_margins.filter(|&m| !m);
         self.full_region = self.full_region.filter(|&f| f);
         self.reverse_wrap = self.reverse_wrap.filter(|&r| !r);
         self.saved = None;
-        self.mode_values.clear();
+        self.mode_values = [None; FLAG_MODES.len()];
     }
 
     fn dec_mode(&mut self, c: Csi) {
         let set = c.final_byte == b'h';
-        let Some(modes) = numbers(c.params, usize::MAX) else {
+        let Some(modes) = all_numbers(c.params) else {
             return self.opaque(c.raw, false);
         };
         if !modes.is_empty() && modes.iter().all(|m| FLAG_MODES.contains(m)) {
@@ -1000,7 +1067,8 @@ impl Minifier {
                     }
                 }
                 self.modes.retain(|&(n, _, _)| n != m);
-                if self.mode_values.get(&m) != Some(&set) {
+                let i = flag_index(m).expect("checked to be a flag mode");
+                if self.mode_values[i] != Some(set) {
                     self.modes.push((m, set, cur));
                     queued = true;
                 }
@@ -1028,8 +1096,8 @@ impl Minifier {
             self.wrote_token(range, c.raw);
         }
         for &m in &modes {
-            if FLAG_MODES.contains(&m) {
-                self.mode_values.insert(m, set);
+            if let Some(i) = flag_index(m) {
+                self.mode_values[i] = Some(set);
             }
         }
         if modes.contains(&6) {
@@ -1059,25 +1127,41 @@ impl Minifier {
             return;
         }
         let modes = std::mem::take(&mut self.modes);
-        let mut seq = Vec::new();
-        for value in [true, false] {
-            let list: Vec<u32> = modes.iter().filter(|m| m.1 == value).map(|m| m.0).collect();
-            for chunk in list.chunks(self.max_params) {
-                seq.extend_from_slice(b"\x1b[?");
-                let joined: Vec<String> = chunk.iter().map(u32::to_string).collect();
-                seq.extend_from_slice(joined.join(";").as_bytes());
-                seq.push(if value { b'h' } else { b'l' });
+        let max_params = self.max_params;
+        let (range, ()) = self.write_with(|out| {
+            for value in [true, false] {
+                let fin = if value { b'h' } else { b'l' };
+                // Parameters in the sequence being written; 0 when none is
+                // open.
+                let mut count = 0;
+                for &(m, _, _) in modes.iter().filter(|m| m.1 == value) {
+                    if count == 0 {
+                        out.extend_from_slice(b"\x1b[?");
+                    } else {
+                        out.push(b';');
+                    }
+                    sgr::push_num(out, m);
+                    count += 1;
+                    if count == max_params {
+                        out.push(fin);
+                        count = 0;
+                    }
+                }
+                if count > 0 {
+                    out.push(fin);
+                }
             }
-        }
+        });
         for &(m, v, _) in &modes {
-            self.mode_values.insert(m, v);
+            let i = flag_index(m).expect("only flag modes are queued");
+            self.mode_values[i] = Some(v);
         }
-        let range = self.write(&seq);
         if let Some(t) = &mut self.trace {
+            let seq = &self.out[range.start - t.out_base..range.end - t.out_base];
             let first = modes[0].2;
             let single = modes.iter().all(|m| m.2 == first);
             for &(_, _, src) in &modes {
-                let fate = if single && t.raw(src) == seq.as_slice() {
+                let fate = if single && t.raw(src) == seq {
                     Fate::Kept
                 } else if single {
                     Fate::Rewritten {
@@ -1132,7 +1216,7 @@ impl Minifier {
                     b'*' | b'.' => 2,
                     _ => 3,
                 };
-                self.desired.charsets.g[slot] = Some(e.raw.to_vec());
+                self.desired.charsets.g[slot] = Some(Designation::new(e.raw));
                 self.defer(CHARSET);
             }
             (b"#", b'8') => self.consume(EVERYTHING, e.raw),
@@ -1193,7 +1277,7 @@ impl Minifier {
         self.desired = state.clone();
         self.emitted = state;
         self.saved = None;
-        self.mode_values.clear();
+        self.mode_values = [None; FLAG_MODES.len()];
         self.title = None;
         self.icon = None;
         self.lr_margins = Some(false);
@@ -1232,7 +1316,7 @@ impl Minifier {
                         self.links_opened
                     };
                     Some(LinkSpec {
-                        spec: rest.to_vec(),
+                        spec: Arc::from(rest),
                         serial,
                     })
                 });
@@ -1392,7 +1476,11 @@ impl Minifier {
 
     fn push_tracked(&mut self, m: Move, source: usize) {
         self.moves.push(m);
-        self.move_sources.push(vec![source]);
+        // Sources are only needed for the trace; skipping them otherwise
+        // saves an allocation per move.
+        if self.trace.is_some() {
+            self.move_sources.push(vec![source]);
+        }
     }
 
     /// Records that the current token was folded into the last move.
@@ -1420,35 +1508,46 @@ impl Minifier {
         }
     }
 
-    fn encode_move(&self, m: &Move, out: &mut Vec<u8>) {
-        // CR equals "column 1" only without margins or origin mode in play.
-        let cr_is_col1 = self.desired.origin == Some(false) && self.lr_margins == Some(false);
+    fn move_encoding(&self) -> MoveEncoding {
+        MoveEncoding {
+            cr_is_col1: self.desired.origin == Some(false) && self.lr_margins == Some(false),
+            compat: self.opts.compat,
+        }
+    }
+}
+
+/// The settings [`Move`]s are written with, copied out of the minifier so
+/// moves can be encoded straight into its output buffer.
+#[derive(Debug, Clone, Copy)]
+struct MoveEncoding {
+    /// CR equals "column 1": no margins or origin mode in play.
+    cr_is_col1: bool,
+    compat: bool,
+}
+
+impl MoveEncoding {
+    fn encode(self, m: &Move, out: &mut Vec<u8>) {
         match m {
             Move::Rel { dir, n } => csi_num(out, *n, 1, *dir),
             Move::Col { n, fin } => {
-                if cr_is_col1 && *n == 1 {
+                if self.cr_is_col1 && *n == 1 {
                     out.push(b'\r');
-                    return;
-                }
-                let mut direct = Vec::new();
-                csi_num(&mut direct, *n, 1, *fin);
-                let mut via_cr = vec![b'\r'];
-                csi_num(&mut via_cr, n - 1, 1, b'C');
-                if cr_is_col1 && via_cr.len() < direct.len() {
-                    out.extend(via_cr);
+                } else if self.cr_is_col1 && 1 + csi_num_len(n - 1, 1) < csi_num_len(*n, 1) {
+                    out.push(b'\r');
+                    csi_num(out, n - 1, 1, b'C');
                 } else {
-                    out.extend(direct);
+                    csi_num(out, *n, 1, *fin);
                 }
             }
             Move::Row { n } => csi_num(out, *n, 1, b'd'),
             Move::Pos { row, col, fin } => {
                 out.extend_from_slice(b"\x1b[");
-                if *row != 1 || (*col != 1 && self.opts.compat) {
-                    out.extend_from_slice(row.to_string().as_bytes());
+                if *row != 1 || (*col != 1 && self.compat) {
+                    sgr::push_num(out, *row);
                 }
                 if *col != 1 {
                     out.push(b';');
-                    out.extend_from_slice(col.to_string().as_bytes());
+                    sgr::push_num(out, *col);
                 }
                 out.push(*fin);
             }
@@ -1469,24 +1568,66 @@ fn agrees(a: &Pen, b: &Pen, mask: u32) -> bool {
     merged == *a
 }
 
-/// Parses up to `max` numeric parameters (empty counts as 0). Returns `None`
-/// for subparameters, too many parameters or values above [`MAX_MOVE`].
-fn numbers(params: &[u8], max: usize) -> Option<Vec<u32>> {
+/// Up to `N` parsed parameters, kept on the stack.
+struct Numbers<const N: usize> {
+    values: [u32; N],
+    len: usize,
+}
+
+// `Deref` lets a `Numbers` be used wherever a `&[u32]` is expected, the way
+// a `Vec` would.
+impl<const N: usize> std::ops::Deref for Numbers<N> {
+    type Target = [u32];
+
+    fn deref(&self) -> &[u32] {
+        &self.values[..self.len]
+    }
+}
+
+/// Parses up to `N` numeric parameters (empty counts as 0). Returns `None`
+/// for subparameters, more than `N` parameters or values above
+/// [`MAX_MOVE`].
+fn numbers<const N: usize>(params: &[u8]) -> Option<Numbers<N>> {
+    let mut out = Numbers {
+        values: [0; N],
+        len: 0,
+    };
+    if params.is_empty() {
+        return Some(out);
+    }
+    for p in params.split(|&b| b == b';') {
+        if out.len == N {
+            return None;
+        }
+        out.values[out.len] = number(p)?;
+        out.len += 1;
+    }
+    Some(out)
+}
+
+/// [`numbers`] without a limit on how many there are.
+fn all_numbers(params: &[u8]) -> Option<Vec<u32>> {
     if params.is_empty() {
         return Some(Vec::new());
     }
-    let mut out = Vec::new();
-    for p in params.split(|&b| b == b';') {
-        if out.len() == max || p.len() > 5 || !p.iter().all(u8::is_ascii_digit) {
-            return None;
-        }
-        let n = p.iter().fold(0u32, |n, &d| n * 10 + u32::from(d - b'0'));
-        if n > MAX_MOVE {
-            return None;
-        }
-        out.push(n);
+    params.split(|&b| b == b';').map(number).collect()
+}
+
+/// One parameter for [`numbers`]: at most five digits and no larger than
+/// [`MAX_MOVE`].
+fn number(param: &[u8]) -> Option<u32> {
+    if param.len() > 5 {
+        return None;
     }
-    Some(out)
+    let n = param.iter().try_fold(0u32, |n, &d| {
+        d.is_ascii_digit().then(|| n * 10 + u32::from(d - b'0'))
+    })?;
+    (n <= MAX_MOVE).then_some(n)
+}
+
+/// Index of a mode in [`FLAG_MODES`], when it is one.
+fn flag_index(mode: u32) -> Option<usize> {
+    FLAG_MODES.iter().position(|&m| m == mode)
 }
 
 /// Parameter `i`, with 0 and missing both meaning 1.
@@ -1498,30 +1639,41 @@ fn at_least_one(n: &[u32], i: usize) -> u32 {
 fn csi_num(out: &mut Vec<u8>, n: u32, default: u32, fin: u8) {
     out.extend_from_slice(b"\x1b[");
     if n != default {
-        out.extend_from_slice(n.to_string().as_bytes());
+        sgr::push_num(out, n);
     }
     out.push(fin);
 }
 
+/// The length of what [`csi_num`] writes.
+fn csi_num_len(n: u32, default: u32) -> usize {
+    3 + if n == default { 0 } else { digits(n) }
+}
+
+/// Number of decimal digits in `n`.
+fn digits(n: u32) -> usize {
+    n.checked_ilog10().map_or(1, |d| d as usize + 1)
+}
+
 /// Rewrites a single-parameter CSI without leading zeros, dropping the
 /// parameter when `is_default` says the terminal would assume it anyway.
-fn normalize_single(c: &Csi, is_default: impl Fn(u32) -> bool) -> Vec<u8> {
-    let Some(n) = numbers(c.params, 1) else {
-        return c.raw.to_vec();
+/// Borrows the input when it is already in that form.
+fn normalize_single<'a>(c: &Csi<'a>, is_default: impl Fn(u32) -> bool) -> Cow<'a, [u8]> {
+    let Some(&[value]) = numbers::<1>(c.params).as_deref() else {
+        return Cow::Borrowed(c.raw);
     };
-    if n.is_empty() {
-        return c.raw.to_vec();
+    let keep = !is_default(value);
+    if keep && c.params.len() == digits(value) {
+        return Cow::Borrowed(c.raw);
     }
     let mut seq = b"\x1b[".to_vec();
     if let Some(p) = c.private {
         seq.push(p);
     }
-    let value = n.first().copied().unwrap_or(0);
-    if !is_default(value) {
-        seq.extend_from_slice(value.to_string().as_bytes());
+    if keep {
+        sgr::push_num(&mut seq, value);
     }
     seq.push(c.final_byte);
-    seq
+    Cow::Owned(seq)
 }
 
 /// OSC commands that neither draw nor move the cursor: palette and dynamic
@@ -1558,47 +1710,46 @@ fn dcs_is_harmless(raw: &[u8]) -> bool {
 /// Writes `text`, replacing runs of a repeated character with REP when that
 /// is shorter.
 fn write_with_rep(text: &str, out: &mut Vec<u8>) {
-    let chars: Vec<char> = text.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        let end = chars[i..]
-            .iter()
-            .position(|&d| d != c)
-            .map_or(chars.len(), |p| i + p);
-        let mut run = end - i;
+    let bytes = text.as_bytes();
+    // Start of the bytes not written yet; they are copied as one slice.
+    let mut literal = 0;
+    let mut chars = text.char_indices().peekable();
+    while let Some((start, c)) = chars.next() {
+        let mut count = 1;
+        while chars.next_if(|&(_, d)| d == c).is_some() {
+            count += 1;
+        }
+        if count < 2 || !rep_safe(c) {
+            continue;
+        }
         // A combining character after the run must follow a literal copy.
-        if end < chars.len() && !cannot_combine(chars[end]) {
-            run -= 1;
-        }
-        let mut buf = [0; 4];
-        let encoded = c.encode_utf8(&mut buf).as_bytes();
-        if rep_safe(c) && run > 1 {
-            let mut repeats = run - 1;
-            out.extend_from_slice(encoded);
-            while repeats > 0 {
-                let n = repeats.min(MAX_MOVE as usize);
-                let mut rep = Vec::new();
-                csi_num(&mut rep, n as u32, 1, b'b');
-                if rep.len() < n * encoded.len() {
-                    out.extend(rep);
-                } else {
-                    for _ in 0..n {
-                        out.extend_from_slice(encoded);
-                    }
-                }
-                repeats -= n;
-            }
-            for _ in run..end - i {
-                out.extend_from_slice(encoded);
-            }
+        let run = if chars.peek().is_some_and(|&(_, next)| !cannot_combine(next)) {
+            count - 1
         } else {
-            for _ in i..end {
-                out.extend_from_slice(encoded);
-            }
+            count
+        };
+        if run < 2 {
+            continue;
         }
-        i = end;
+        let width = c.len_utf8();
+        let encoded = &bytes[start..start + width];
+        out.extend_from_slice(&bytes[literal..start + width]);
+        let mut repeats = run - 1;
+        while repeats > 0 {
+            let n = repeats.min(MAX_MOVE as usize);
+            if csi_num_len(n as u32, 1) < n * width {
+                csi_num(out, n as u32, 1, b'b');
+            } else {
+                for _ in 0..n {
+                    out.extend_from_slice(encoded);
+                }
+            }
+            repeats -= n;
+        }
+        // A copy held back for a combining character stays literal.
+        literal = start + width * run;
     }
+    out.extend_from_slice(&bytes[literal..]);
 }
 
 /// Characters REP can repeat safely: single-width and never combining.
@@ -1643,5 +1794,83 @@ fn only_sets_attributes(token: &Token) -> bool {
             .first()
             .is_some_and(|i| b"()*+-./".contains(i)),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_bounded_numbers() {
+        assert_eq!(numbers::<2>(b"").as_deref(), Some(&[][..]));
+        assert_eq!(numbers::<2>(b"3;0012").as_deref(), Some(&[3, 12][..]));
+        assert!(numbers::<1>(b"1;2").is_none());
+        assert!(numbers::<1>(b"10000").is_none());
+        assert!(numbers::<1>(b"1:2").is_none());
+        assert_eq!(all_numbers(b"25;1049;2004"), Some(vec![25, 1049, 2004]));
+    }
+
+    #[test]
+    fn normalizes_only_when_shorter() {
+        let csi = |raw: &'static [u8]| match lexer::scan(raw, true) {
+            Scan::Token(Token::Csi(c), _) => c,
+            other => panic!("{other:?}"),
+        };
+        let erase = |raw| normalize_single(&csi(raw), |n| n == 0);
+        assert!(matches!(erase(b"\x1b[2J"), Cow::Borrowed(b"\x1b[2J")));
+        assert!(matches!(erase(b"\x1b[K"), Cow::Borrowed(b"\x1b[K")));
+        assert_eq!(&*erase(b"\x1b[0K"), b"\x1b[K");
+        assert_eq!(&*erase(b"\x1b[?02J"), b"\x1b[?2J");
+    }
+
+    #[test]
+    fn rep_replaces_runs() {
+        let rep = |text: &str| {
+            let mut out = Vec::new();
+            write_with_rep(text, &mut out);
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(rep("ab"), "ab");
+        assert_eq!(rep("xaaaaaay"), "xa\x1b[5by");
+        assert_eq!(rep("────────"), "─\x1b[7b");
+        // A combining mark after the run keeps the last copy literal.
+        assert_eq!(rep("aaaaaaa\u{301}"), "a\x1b[5ba\u{301}");
+        // Not shorter: left alone.
+        assert_eq!(rep("aaa"), "aaa");
+    }
+
+    #[test]
+    fn encodes_moves() {
+        let encode = |m: Move, cr_is_col1| {
+            let mut out = Vec::new();
+            MoveEncoding {
+                cr_is_col1,
+                compat: false,
+            }
+            .encode(&m, &mut out);
+            out
+        };
+        assert_eq!(encode(Move::Col { n: 1, fin: b'G' }, true), b"\r");
+        assert_eq!(encode(Move::Col { n: 12, fin: b'G' }, true), b"\x1b[12G");
+        assert_eq!(
+            encode(
+                Move::Pos {
+                    row: 1,
+                    col: 5,
+                    fin: b'H'
+                },
+                false
+            ),
+            b"\x1b[;5H"
+        );
+    }
+
+    #[test]
+    fn designations_round_trip() {
+        assert_eq!(Designation::new(b"\x1b(B").as_bytes(), b"\x1b(B");
+        assert_eq!(Designation::new(b"\x1b-%6").as_bytes(), b"\x1b-%6");
+        assert_eq!(flag_index(25), Some(3));
+        assert_eq!(flag_index(1049), None);
     }
 }

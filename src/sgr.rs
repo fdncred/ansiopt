@@ -270,33 +270,16 @@ impl Pen {
         if params.ends_with(b";") {
             return false;
         }
-        // Sequences rarely have more than a few parameters, so keep them on
-        // the stack; only a longer one spills into a Vec.
-        let mut stack: [&[u8]; 16] = [&[]; 16];
-        let mut spilled: Vec<&[u8]> = Vec::new();
-        let mut count = 0;
-        for param in params.split(|&b| b == b';') {
-            if count < stack.len() {
-                stack[count] = param;
-            } else {
-                if spilled.is_empty() {
-                    spilled.extend_from_slice(&stack);
-                }
-                spilled.push(param);
-            }
-            count += 1;
-        }
-        let params: &[&[u8]] = if count <= stack.len() {
-            &stack[..count]
-        } else {
-            &spilled
+        // A lazy iterator over the parameters: extended colors pull their
+        // arguments from it as they go.
+        let mut params = Params {
+            bytes: params,
+            done: false,
         };
-        let mut i = 0;
-        while i < params.len() {
-            let Some(code) = number(params[i]) else {
+        while let Some(param) = params.next() {
+            let Some(code) = param.value else {
                 return false;
             };
-            i += 1;
             match code {
                 0 => *self = Pen::DEFAULT,
                 1 => self.intensity.set_bold(),
@@ -332,22 +315,23 @@ impl Pen {
                 90..=97 => self.fg = Some(Color::Bright((code - 90) as u8)),
                 100..=107 => self.bg = Some(Color::Bright((code - 100) as u8)),
                 38 | 48 => {
-                    let color = match params.get(i).copied().and_then(number) {
+                    let color = match params.next().and_then(|p| p.value) {
                         Some(5) => {
-                            let Some(n) = params.get(i + 1).copied().and_then(byte) else {
+                            let Some(n) = params.next().and_then(Param::byte) else {
                                 return false;
                             };
-                            i += 2;
                             Color::Indexed(n)
                         }
                         Some(2) => {
-                            let Some(&[r, g, b]) = params.get(i + 1..i + 4) else {
+                            // Tuple fields are evaluated left to right, so a
+                            // missing component leaves the rest `None` too.
+                            let (Some(r), Some(g), Some(b)) = (
+                                params.next().and_then(Param::byte),
+                                params.next().and_then(Param::byte),
+                                params.next().and_then(Param::byte),
+                            ) else {
                                 return false;
                             };
-                            let (Some(r), Some(g), Some(b)) = (byte(r), byte(g), byte(b)) else {
-                                return false;
-                            };
-                            i += 4;
                             Color::Rgb(r, g, b)
                         }
                         _ => return false,
@@ -365,32 +349,75 @@ impl Pen {
     }
 }
 
-/// Parses a decimal parameter; an empty parameter is 0. Rejects
-/// sub-parameters.
-fn number(param: &[u8]) -> Option<u32> {
-    if param.len() > 9 || !param.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    Some(param.iter().fold(0, |n, &d| n * 10 + u32::from(d - b'0')))
+/// One SGR parameter, parsed while splitting.
+#[derive(Debug, Clone, Copy)]
+struct Param {
+    /// The decimal value, `None` for anything but at most nine digits
+    /// (sub-parameters included). An empty parameter is 0.
+    value: Option<u32>,
+    empty: bool,
 }
 
-/// Parses a parameter that must be present and fit in a byte.
-fn byte(param: &[u8]) -> Option<u8> {
-    if param.is_empty() {
-        return None;
+impl Param {
+    /// The value of a parameter that must be present and fit in a byte.
+    fn byte(self) -> Option<u8> {
+        if self.empty {
+            return None;
+        }
+        self.value.and_then(|n| u8::try_from(n).ok())
     }
-    number(param).and_then(|n| u8::try_from(n).ok())
+}
+
+/// Splits parameters at `;` and parses each one in the same pass.
+struct Params<'a> {
+    bytes: &'a [u8],
+    done: bool,
+}
+
+impl Iterator for Params<'_> {
+    type Item = Param;
+
+    fn next(&mut self) -> Option<Param> {
+        if self.done {
+            return None;
+        }
+        let (mut value, mut digits, mut valid) = (0u32, 0, true);
+        let mut rest = self.bytes.iter();
+        loop {
+            match rest.next() {
+                None => {
+                    self.done = true;
+                    break;
+                }
+                Some(b';') => break,
+                Some(&b) => {
+                    digits += 1;
+                    valid &= b.is_ascii_digit();
+                    // Wrapping: the value is discarded unless every byte
+                    // was a digit and there were at most nine of them.
+                    value = value
+                        .wrapping_mul(10)
+                        .wrapping_add(u32::from(b.wrapping_sub(b'0')));
+                }
+            }
+        }
+        self.bytes = rest.as_slice();
+        Some(Param {
+            value: (valid && digits <= 9).then_some(value),
+            empty: digits == 0,
+        })
+    }
 }
 
 /// One SGR parameter (possibly several `;`-separated numbers, like
 /// `38;5;196`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Code {
-    Num(u32),
+    Num(u8),
     /// `base;5;n`.
-    Indexed(u32, u8),
+    Indexed(u8, u8),
     /// `base;2;r;g;b`.
-    Rgb(u32, u8, u8, u8),
+    Rgb(u8, u8, u8, u8),
 }
 
 impl Code {
@@ -405,14 +432,14 @@ impl Code {
 
     fn write(self, out: &mut impl Sink) {
         match self {
-            Code::Num(n) => out.num(n),
+            Code::Num(n) => out.num(u32::from(n)),
             Code::Indexed(base, n) => {
-                out.num(base);
+                out.num(u32::from(base));
                 out.put(b";5;");
                 out.num(u32::from(n));
             }
             Code::Rgb(base, r, g, b) => {
-                out.num(base);
+                out.num(u32::from(base));
                 out.put(b";2;");
                 out.num(u32::from(r));
                 out.put(b";");
@@ -430,7 +457,10 @@ impl Code {
 #[derive(Clone, Copy)]
 struct Codes {
     items: [Code; 16],
-    len: usize,
+    len: u8,
+    /// Some code turns a field back to its default (`22`, `39`, ...).
+    /// Without one, a reset can never be shorter; see [`shortest`].
+    clears: bool,
 }
 
 impl Codes {
@@ -438,16 +468,17 @@ impl Codes {
         Codes {
             items: [Code::Num(0); 16],
             len: 0,
+            clears: false,
         }
     }
 
     fn push(&mut self, code: Code) {
-        self.items[self.len] = code;
+        self.items[usize::from(self.len)] = code;
         self.len += 1;
     }
 
     fn as_slice(&self) -> &[Code] {
-        &self.items[..self.len]
+        &self.items[..usize::from(self.len)]
     }
 }
 
@@ -464,19 +495,36 @@ impl Sink for Vec<u8> {
     }
 
     fn num(&mut self, n: u32) {
-        let mut digits = [0; 10];
-        let mut i = digits.len();
-        let mut n = n;
-        loop {
-            i -= 1;
-            digits[i] = b'0' + (n % 10) as u8;
-            n /= 10;
-            if n == 0 {
-                break;
-            }
-        }
-        self.extend_from_slice(&digits[i..]);
+        push_num(self, n);
     }
+}
+
+/// Appends `n` in decimal without allocating a `String`.
+pub(crate) fn push_num(out: &mut Vec<u8>, mut n: u32) {
+    // Nearly every number written (SGR codes, color components, cursor
+    // positions) is below 1000. Fixed-size appends compile to plain stores
+    // instead of a `memcpy` call.
+    let digit = |d: u32| b'0' + d as u8;
+    if n < 10 {
+        return out.push(digit(n));
+    }
+    if n < 100 {
+        return out.extend_from_slice(&[digit(n / 10), digit(n % 10)]);
+    }
+    if n < 1000 {
+        return out.extend_from_slice(&[digit(n / 100), digit(n / 10 % 10), digit(n % 10)]);
+    }
+    let mut digits = [0; 10];
+    let mut i = digits.len();
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&digits[i..]);
 }
 
 /// Counts the bytes that would be written.
@@ -492,17 +540,17 @@ impl Sink for Measure {
     }
 }
 
-fn color_code(color: &Color, base: u32) -> Code {
+fn color_code(color: &Color, base: u8) -> Code {
     match color {
         Color::Default => Code::Num(base + 1),
-        Color::Basic(n) => Code::Num(base - 8 + u32::from(*n)),
-        Color::Bright(n) => Code::Num(base + 52 + u32::from(*n)),
+        Color::Basic(n) => Code::Num(base - 8 + *n),
+        Color::Bright(n) => Code::Num(base + 52 + *n),
         Color::Indexed(n) => Code::Indexed(base, *n),
         Color::Rgb(r, g, b) => Code::Rgb(base, *r, *g, *b),
     }
 }
 
-fn flag(on: u32, off: u32) -> impl Fn(&bool) -> Code {
+fn flag(on: u8, off: u8) -> impl Fn(&bool) -> Code {
     move |&v| Code::Num(if v { on } else { off })
 }
 
@@ -518,6 +566,7 @@ fn diff_codes(from: &Pen, to: &Pen) -> Option<Codes> {
                 // An unknown target must equal the (equally unknown) source.
                 let value = to.$field.as_ref()?;
                 out.push($encode(value));
+                out.clears |= to.$field == Pen::DEFAULT.$field;
             }
         };
     }
@@ -527,7 +576,7 @@ fn diff_codes(from: &Pen, to: &Pen) -> Option<Codes> {
     field!(inverse, flag(7, 27));
     field!(hidden, flag(8, 28));
     field!(strike, flag(9, 29));
-    field!(font, |v: &u8| Code::Num(10 + u32::from(*v)));
+    field!(font, |v: &u8| Code::Num(10 + *v));
     field!(proportional, flag(26, 50));
     field!(frame, |f: &Frame| Code::Num(match f {
         Frame::Off => 54,
@@ -556,6 +605,7 @@ fn intensity_codes(from: &Intensity, to: &Intensity, out: &mut Codes) -> Option<
         to.bold?;
         to.dim?;
         out.push(Code::Num(22));
+        out.clears = true;
         push_intensity(to, out);
         return Some(());
     }
@@ -676,42 +726,123 @@ pub(crate) fn transition_into(
     style: Style,
     out: &mut Vec<u8>,
 ) -> Pen {
-    // Candidates are measured rather than written; only the winner is.
-    let mut best: Option<(usize, Codes, bool, Pen)> = None;
-    let mut consider = |codes: Codes, reset: bool, state: Pen| {
+    let best = shortest(from, full_target, mask, style);
+    write_codes(best.codes.as_slice(), best.reset, style, out);
+    best.state
+}
+
+/// A candidate encoding for [`transition`]: its codes, whether they follow
+/// a reset, and the pen the terminal has afterwards.
+#[derive(Clone, Copy)]
+struct Candidate {
+    codes: Codes,
+    reset: bool,
+    state: Pen,
+}
+
+impl Candidate {
+    fn len(&self, style: Style) -> usize {
         let mut len = Measure(0);
-        write_codes(codes.as_slice(), reset, style, &mut len);
-        if best.as_ref().is_none_or(|(b, ..)| len.0 < *b) {
-            best = Some((len.0, codes, reset, state));
+        write_codes(self.codes.as_slice(), self.reset, style, &mut len);
+        len.0
+    }
+}
+
+/// The shortest candidate offered so far. Candidates are measured rather
+/// than written, and only once there is a choice to make.
+struct Shortest {
+    style: Style,
+    best: Option<Candidate>,
+    /// The length of `best`, once something has been compared with it.
+    best_len: Option<usize>,
+}
+
+impl Shortest {
+    /// Keeps `candidate` if it is strictly shorter, so earlier candidates
+    /// win ties.
+    fn offer(&mut self, candidate: Candidate) {
+        let Some(best) = &self.best else {
+            self.best = Some(candidate);
+            return;
+        };
+        let style = self.style;
+        let best_len = *self.best_len.get_or_insert_with(|| best.len(style));
+        let len = candidate.len(style);
+        if len < best_len {
+            self.best = Some(candidate);
+            self.best_len = Some(len);
         }
+    }
+}
+
+/// Chooses the encoding [`transition`] writes.
+fn shortest(from: &Pen, full_target: &Pen, mask: Mask, style: Style) -> Candidate {
+    // Any diff writes at least `ESC[Nm`, so a bare `ESC[m` is the shortest
+    // way to the default pen. With a partial mask a diff of the masked
+    // fields alone may still be empty, so this is for full syncs only.
+    if mask == ALL && *full_target == Pen::DEFAULT && *from != Pen::DEFAULT {
+        return Candidate {
+            codes: Codes::new(),
+            reset: true,
+            state: Pen::DEFAULT,
+        };
+    }
+
+    let mut shortest = Shortest {
+        style,
+        best: None,
+        best_len: None,
     };
 
     // The full target goes first so it wins ties: it leaves less work for
-    // later. With a partial mask, also try changing only the masked fields.
-    let mut lazy = *from;
-    lazy.copy_from(full_target, mask);
-    let targets: &[Pen] = if mask == ALL {
-        &[*full_target]
-    } else {
-        &[*full_target, lazy]
-    };
-    for target in targets {
-        if let Some(codes) = diff_codes(from, target) {
-            consider(codes, false, *target);
+    // later.
+    let diff = diff_codes(from, full_target);
+    if let Some(codes) = diff {
+        shortest.offer(Candidate {
+            codes,
+            reset: false,
+            state: *full_target,
+        });
+    }
+    let known = full_target.is_known();
+    // A diff that turns nothing off is a subsequence of the codes after a
+    // reset (same fields, same order), and the reset adds a parameter of
+    // its own. Inserting parameters never lets `write_codes` split into
+    // fewer sequences, so the reset is always longer and need not be
+    // measured.
+    if known && diff.is_none_or(|d| d.clears) {
+        shortest.offer(Candidate {
+            codes: diff_codes(&Pen::DEFAULT, full_target).expect("default is known"),
+            reset: true,
+            state: *full_target,
+        });
+    }
+    // With a partial mask, also try changing only the masked fields.
+    if mask != ALL {
+        let mut lazy = *from;
+        lazy.copy_from(full_target, mask);
+        if let Some(codes) = diff_codes(from, &lazy) {
+            shortest.offer(Candidate {
+                codes,
+                reset: false,
+                state: lazy,
+            });
         }
-        if full_target.is_known() {
+        if known {
             // After a reset, fields outside the mask may as well stay at
             // their defaults.
             let mut reset_target = Pen::DEFAULT;
-            reset_target.copy_from(target, if target == full_target { ALL } else { mask });
-            let codes = diff_codes(&Pen::DEFAULT, &reset_target).expect("default is known");
-            consider(codes, true, reset_target);
+            reset_target.copy_from(&lazy, if lazy == *full_target { ALL } else { mask });
+            shortest.offer(Candidate {
+                codes: diff_codes(&Pen::DEFAULT, &reset_target).expect("default is known"),
+                reset: true,
+                state: reset_target,
+            });
         }
     }
-    let (_, codes, reset, state) =
-        best.expect("the diff to the full target only fails when a reset is allowed");
-    write_codes(codes.as_slice(), reset, style, out);
-    state
+    shortest
+        .best
+        .expect("the diff to the full target only fails when a reset is allowed")
 }
 
 #[cfg(test)]
@@ -793,6 +924,130 @@ mod tests {
         let to = pen("1;3;4;38;2;1;2;3");
         let (text, _) = transition(&Pen::DEFAULT, &to, ALL, style);
         assert_eq!(text.replace('\x1b', "\\e"), "\\e[1;3;4m\\e[38;2;1;2;3m");
+    }
+
+    #[test]
+    fn writes_numbers() {
+        for n in [0, 7, 9, 10, 42, 99, 100, 255, 999, 1000, 9999, u32::MAX] {
+            let mut out = Vec::new();
+            push_num(&mut out, n);
+            assert_eq!(out, n.to_string().as_bytes());
+        }
+    }
+
+    #[test]
+    fn parses_params_in_one_pass() {
+        let parse = |params: &[u8]| {
+            Params {
+                bytes: params,
+                done: false,
+            }
+            .map(|p| (p.value, p.empty))
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(parse(b""), [(Some(0), true)]);
+        assert_eq!(
+            parse(b"38;;007"),
+            [(Some(38), false), (Some(0), true), (Some(7), false)]
+        );
+        assert_eq!(parse(b"4:3"), [(None, false)]);
+        assert_eq!(
+            parse(b"123456789;1234567890"),
+            [(Some(123_456_789), false), (None, false)]
+        );
+    }
+
+    #[test]
+    fn default_target_is_a_bare_reset() {
+        assert_eq!(sync(&pen("1;3;38;2;1;2;3"), &Pen::DEFAULT), "\\e[m");
+        let compat = Style {
+            empty_reset: false,
+            max_params: 2,
+        };
+        let (text, state) = transition(&pen("4"), &Pen::DEFAULT, ALL, compat);
+        assert_eq!(text, "\x1b[m");
+        assert_eq!(state, Pen::DEFAULT);
+    }
+
+    /// The shortcuts in [`shortest`] pick exactly what measuring the diff
+    /// and the reset would, for every sequence length limit.
+    #[test]
+    fn shortcuts_match_measuring_every_candidate() {
+        const CODES: [&str; 14] = [
+            "0",
+            "1",
+            "2",
+            "22",
+            "3",
+            "23",
+            "4",
+            "24",
+            "31",
+            "39",
+            "44",
+            "49",
+            "38;5;196",
+            "48;2;10;200;3",
+        ];
+        /// splitmix64, so the test is deterministic without a dependency.
+        struct Rng(u64);
+        impl Rng {
+            fn below(&mut self, n: usize) -> usize {
+                self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut z = self.0;
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                ((z ^ (z >> 31)) % n as u64) as usize
+            }
+        }
+        let random_pen = |rng: &mut Rng, start: Pen| {
+            let mut p = start;
+            for _ in 0..rng.below(5) {
+                assert!(p.apply(CODES[rng.below(CODES.len())].as_bytes()));
+            }
+            p
+        };
+        let mut rng = Rng(0x1234_5678);
+        for _ in 0..2_000 {
+            let start = if rng.below(4) == 0 {
+                Pen::UNKNOWN
+            } else {
+                Pen::DEFAULT
+            };
+            let from = random_pen(&mut rng, start);
+            let base = if rng.below(3) == 0 {
+                from
+            } else {
+                Pen::DEFAULT
+            };
+            let to = random_pen(&mut rng, base);
+            if from == to {
+                continue;
+            }
+            for max_params in 1..=6 {
+                for empty_reset in [true, false] {
+                    let style = Style {
+                        empty_reset,
+                        max_params,
+                    };
+                    let measure = |codes: Codes, reset| {
+                        let mut len = Measure(0);
+                        write_codes(codes.as_slice(), reset, style, &mut len);
+                        len.0
+                    };
+                    let diff = diff_codes(&from, &to).map(|c| measure(c, false));
+                    let reset = to
+                        .is_known()
+                        .then(|| measure(diff_codes(&Pen::DEFAULT, &to).unwrap(), true));
+                    let expected = match (diff, reset) {
+                        (Some(d), Some(r)) => d.min(r),
+                        (d, r) => d.or(r).unwrap(),
+                    };
+                    let (text, _) = transition(&from, &to, ALL, style);
+                    assert_eq!(text.len(), expected, "{from:?} -> {to:?} with {style:?}");
+                }
+            }
+        }
     }
 
     #[test]

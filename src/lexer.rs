@@ -196,12 +196,14 @@ fn scan_text(input: &[u8], eof: bool) -> Scan<'_> {
     };
 
     // C1 code points are controls in some terminals; never treat them as text.
+    // In UTF-8 they are C2 80 to C2 9F, and C2 never continues a character.
     let c1 = valid
-        .char_indices()
-        .find(|&(_, c)| ('\u{80}'..='\u{9f}').contains(&c));
+        .as_bytes()
+        .windows(2)
+        .position(|pair| pair[0] == 0xc2 && (0x80..=0x9f).contains(&pair[1]));
     match c1 {
-        Some((0, c)) => opaque(&input[..c.len_utf8()], false),
-        Some((i, _)) => Scan::Token(Token::Text(&valid[..i]), i),
+        Some(0) => opaque(&input[..2], false),
+        Some(i) => Scan::Token(Token::Text(&valid[..i]), i),
         None if valid.is_empty() => opaque(&input[..invalid_len], false),
         None => Scan::Token(Token::Text(valid), valid.len()),
     }

@@ -117,7 +117,10 @@ pub struct Pen {
 
 impl PartialEq for Pen {
     fn eq(&self, other: &Self) -> bool {
-        self.intensity.eq_effective(&other.intensity)
+        // Colors and intensity differ most often, so they go first.
+        self.fg == other.fg
+            && self.bg == other.bg
+            && self.intensity.eq_effective(&other.intensity)
             && self.italic == other.italic
             && self.underline == other.underline
             && self.blink == other.blink
@@ -129,8 +132,6 @@ impl PartialEq for Pen {
             && self.frame == other.frame
             && self.overline == other.overline
             && self.script == other.script
-            && self.fg == other.fg
-            && self.bg == other.bg
     }
 }
 
@@ -269,7 +270,27 @@ impl Pen {
         if params.ends_with(b";") {
             return false;
         }
-        let params: Vec<&[u8]> = params.split(|&b| b == b';').collect();
+        // Sequences rarely have more than a few parameters, so keep them on
+        // the stack; only a longer one spills into a Vec.
+        let mut stack: [&[u8]; 16] = [&[]; 16];
+        let mut spilled: Vec<&[u8]> = Vec::new();
+        let mut count = 0;
+        for param in params.split(|&b| b == b';') {
+            if count < stack.len() {
+                stack[count] = param;
+            } else {
+                if spilled.is_empty() {
+                    spilled.extend_from_slice(&stack);
+                }
+                spilled.push(param);
+            }
+            count += 1;
+        }
+        let params: &[&[u8]] = if count <= stack.len() {
+            &stack[..count]
+        } else {
+            &spilled
+        };
         let mut i = 0;
         while i < params.len() {
             let Some(code) = number(params[i]) else {
@@ -320,10 +341,10 @@ impl Pen {
                             Color::Indexed(n)
                         }
                         Some(2) => {
-                            let rgb: Option<Vec<u8>> = params
-                                .get(i + 1..i + 4)
-                                .map(|p| p.iter().copied().filter_map(byte).collect());
-                            let Some(&[r, g, b]) = rgb.as_deref() else {
+                            let Some(&[r, g, b]) = params.get(i + 1..i + 4) else {
+                                return false;
+                            };
+                            let (Some(r), Some(g), Some(b)) = (byte(r), byte(g), byte(b)) else {
                                 return false;
                             };
                             i += 4;
@@ -363,26 +384,132 @@ fn byte(param: &[u8]) -> Option<u8> {
 
 /// One SGR parameter (possibly several `;`-separated numbers, like
 /// `38;5;196`).
-type Code = String;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Code {
+    Num(u32),
+    /// `base;5;n`.
+    Indexed(u32, u8),
+    /// `base;2;r;g;b`.
+    Rgb(u32, u8, u8, u8),
+}
 
-fn color_code(color: &Color, base: u32) -> Code {
-    match color {
-        Color::Default => format!("{}", base + 1),
-        Color::Basic(n) => format!("{}", base - 8 + u32::from(*n)),
-        Color::Bright(n) => format!("{}", base + 52 + u32::from(*n)),
-        Color::Indexed(n) => format!("{base};5;{n}"),
-        Color::Rgb(r, g, b) => format!("{base};2;{r};{g};{b}"),
+impl Code {
+    /// How many `;`-separated numbers it writes, for [`Style::max_params`].
+    fn params(self) -> usize {
+        match self {
+            Code::Num(_) => 1,
+            Code::Indexed(..) => 3,
+            Code::Rgb(..) => 5,
+        }
+    }
+
+    fn write(self, out: &mut impl Sink) {
+        match self {
+            Code::Num(n) => out.num(n),
+            Code::Indexed(base, n) => {
+                out.num(base);
+                out.put(b";5;");
+                out.num(u32::from(n));
+            }
+            Code::Rgb(base, r, g, b) => {
+                out.num(base);
+                out.put(b";2;");
+                out.num(u32::from(r));
+                out.put(b";");
+                out.num(u32::from(g));
+                out.put(b";");
+                out.num(u32::from(b));
+            }
+        }
     }
 }
 
-fn flag(on: &'static str, off: &'static str) -> impl Fn(&bool) -> Code {
-    move |&v| if v { on } else { off }.into()
+/// The codes of one transition. [`diff_codes`] writes at most 16: three for
+/// intensity, one for each of the other eleven flag-like fields, and one each
+/// for the colors.
+#[derive(Clone, Copy)]
+struct Codes {
+    items: [Code; 16],
+    len: usize,
+}
+
+impl Codes {
+    const fn new() -> Codes {
+        Codes {
+            items: [Code::Num(0); 16],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, code: Code) {
+        self.items[self.len] = code;
+        self.len += 1;
+    }
+
+    fn as_slice(&self) -> &[Code] {
+        &self.items[..self.len]
+    }
+}
+
+/// Where SGR text goes: a buffer, or a counter that measures a candidate
+/// without writing it.
+trait Sink {
+    fn put(&mut self, bytes: &[u8]);
+    fn num(&mut self, n: u32);
+}
+
+impl Sink for Vec<u8> {
+    fn put(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+
+    fn num(&mut self, n: u32) {
+        let mut digits = [0; 10];
+        let mut i = digits.len();
+        let mut n = n;
+        loop {
+            i -= 1;
+            digits[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        self.extend_from_slice(&digits[i..]);
+    }
+}
+
+/// Counts the bytes that would be written.
+struct Measure(usize);
+
+impl Sink for Measure {
+    fn put(&mut self, bytes: &[u8]) {
+        self.0 += bytes.len();
+    }
+
+    fn num(&mut self, n: u32) {
+        self.0 += n.checked_ilog10().map_or(1, |d| d as usize + 1);
+    }
+}
+
+fn color_code(color: &Color, base: u32) -> Code {
+    match color {
+        Color::Default => Code::Num(base + 1),
+        Color::Basic(n) => Code::Num(base - 8 + u32::from(*n)),
+        Color::Bright(n) => Code::Num(base + 52 + u32::from(*n)),
+        Color::Indexed(n) => Code::Indexed(base, *n),
+        Color::Rgb(r, g, b) => Code::Rgb(base, *r, *g, *b),
+    }
+}
+
+fn flag(on: u32, off: u32) -> impl Fn(&bool) -> Code {
+    move |&v| Code::Num(if v { on } else { off })
 }
 
 /// Codes that move field-by-field from `from` to `to`, or `None` when that
 /// is impossible without disturbing an unknown attribute.
-fn diff_codes(from: &Pen, to: &Pen) -> Option<Vec<Code>> {
-    let mut out = Vec::new();
+fn diff_codes(from: &Pen, to: &Pen) -> Option<Codes> {
+    let mut out = Codes::new();
     intensity_codes(&from.intensity, &to.intensity, &mut out)?;
 
     macro_rules! field {
@@ -394,31 +521,31 @@ fn diff_codes(from: &Pen, to: &Pen) -> Option<Vec<Code>> {
             }
         };
     }
-    field!(italic, flag("3", "23"));
-    field!(underline, flag("4", "24"));
-    field!(blink, flag("5", "25"));
-    field!(inverse, flag("7", "27"));
-    field!(hidden, flag("8", "28"));
-    field!(strike, flag("9", "29"));
-    field!(font, |v: &u8| format!("{}", 10 + v));
-    field!(proportional, flag("26", "50"));
-    field!(frame, |f: &Frame| match f {
-        Frame::Off => "54".into(),
-        Frame::Framed => "51".into(),
-        Frame::Encircled => "52".into(),
-    });
-    field!(overline, flag("53", "55"));
-    field!(script, |s: &Script| match s {
-        Script::Off => "75".into(),
-        Script::Super => "73".into(),
-        Script::Sub => "74".into(),
-    });
+    field!(italic, flag(3, 23));
+    field!(underline, flag(4, 24));
+    field!(blink, flag(5, 25));
+    field!(inverse, flag(7, 27));
+    field!(hidden, flag(8, 28));
+    field!(strike, flag(9, 29));
+    field!(font, |v: &u8| Code::Num(10 + u32::from(*v)));
+    field!(proportional, flag(26, 50));
+    field!(frame, |f: &Frame| Code::Num(match f {
+        Frame::Off => 54,
+        Frame::Framed => 51,
+        Frame::Encircled => 52,
+    }));
+    field!(overline, flag(53, 55));
+    field!(script, |s: &Script| Code::Num(match s {
+        Script::Off => 75,
+        Script::Super => 73,
+        Script::Sub => 74,
+    }));
     field!(fg, |c: &Color| color_code(c, 38));
     field!(bg, |c: &Color| color_code(c, 48));
     Some(out)
 }
 
-fn intensity_codes(from: &Intensity, to: &Intensity, out: &mut Vec<Code>) -> Option<()> {
+fn intensity_codes(from: &Intensity, to: &Intensity, out: &mut Codes) -> Option<()> {
     if from.eq_effective(to) {
         return Some(());
     }
@@ -428,7 +555,7 @@ fn intensity_codes(from: &Intensity, to: &Intensity, out: &mut Vec<Code>) -> Opt
         // `22` clears both, so neither may be unknown.
         to.bold?;
         to.dim?;
-        out.push("22".into());
+        out.push(Code::Num(22));
         push_intensity(to, out);
         return Some(());
     }
@@ -438,12 +565,13 @@ fn intensity_codes(from: &Intensity, to: &Intensity, out: &mut Vec<Code>) -> Opt
     if (to.bold != from.bold && !add_bold) || (to.dim != from.dim && !add_dim) {
         return None;
     }
+    let (bold, dim) = (Code::Num(1), Code::Num(2));
     if !to.both() {
         if add_bold {
-            out.push("1".into());
+            out.push(bold);
         }
         if add_dim {
-            out.push("2".into());
+            out.push(dim);
         }
         return Some(());
     }
@@ -452,32 +580,37 @@ fn intensity_codes(from: &Intensity, to: &Intensity, out: &mut Vec<Code>) -> Opt
     match (add_bold, add_dim) {
         (true, true) => push_intensity(to, out),
         (true, false) => {
-            out.push("1".into());
+            out.push(bold);
             if to.dim_last {
-                out.push("2".into());
+                out.push(dim);
             }
         }
         (false, true) => {
-            out.push("2".into());
+            out.push(dim);
             if !to.dim_last {
-                out.push("1".into());
+                out.push(bold);
             }
         }
         // Only the order changed: repeating the winner is enough.
-        (false, false) => out.push(if to.dim_last { "2" } else { "1" }.into()),
+        (false, false) => out.push(if to.dim_last { dim } else { bold }),
     }
     Some(())
 }
 
 /// Pushes the codes that turn on the intensities in `to` from normal.
-fn push_intensity(to: &Intensity, out: &mut Vec<Code>) {
-    let bold = to.bold == Some(true);
-    let dim = to.dim == Some(true);
-    match (bold, dim) {
-        (true, true) if to.dim_last => out.extend(["1".into(), "2".into()]),
-        (true, true) => out.extend(["2".into(), "1".into()]),
-        (true, false) => out.push("1".into()),
-        (false, true) => out.push("2".into()),
+fn push_intensity(to: &Intensity, out: &mut Codes) {
+    let (bold, dim) = (Code::Num(1), Code::Num(2));
+    match (to.bold == Some(true), to.dim == Some(true)) {
+        (true, true) if to.dim_last => {
+            out.push(bold);
+            out.push(dim);
+        }
+        (true, true) => {
+            out.push(dim);
+            out.push(bold);
+        }
+        (true, false) => out.push(bold),
+        (false, true) => out.push(dim),
         (false, false) => {}
     }
 }
@@ -492,33 +625,33 @@ pub struct Style {
 }
 
 /// Writes `codes` as SGR sequences, prefixed by a reset when `reset` is set.
-fn write_codes(codes: &[Code], reset: bool, style: Style, out: &mut String) {
+fn write_codes(codes: &[Code], reset: bool, style: Style, out: &mut impl Sink) {
     if codes.is_empty() {
         if reset {
-            out.push_str("\x1b[m");
+            out.put(b"\x1b[m");
         }
         return;
     }
     let max = style.max_params.max(1);
     let mut count = 0;
-    out.push_str("\x1b[");
+    out.put(b"\x1b[");
     if reset {
-        out.push_str(if style.empty_reset { "" } else { "0" });
+        out.put(if style.empty_reset { b"" } else { b"0" });
         count = 1;
     }
-    for code in codes {
-        let n = code.split(';').count();
+    for &code in codes {
+        let n = code.params();
         if count > 0 && count + n > max {
-            out.push_str("m\x1b[");
+            out.put(b"m\x1b[");
             count = 0;
         }
         if count > 0 {
-            out.push(';');
+            out.put(b";");
         }
-        out.push_str(code);
+        code.write(out);
         count += n;
     }
-    out.push('m');
+    out.put(b"m");
 }
 
 /// Returns the shortest SGR text that takes a terminal from `from` to a
@@ -529,10 +662,27 @@ fn write_codes(codes: &[Code], reset: bool, style: Style, out: &mut String) {
 /// is fully known, because a reset destroys unknown attributes that could
 /// never be restored.
 pub fn transition(from: &Pen, full_target: &Pen, mask: Mask, style: Style) -> (String, Pen) {
-    let mut best: Option<(String, Pen)> = None;
-    let mut consider = |text: String, state: Pen| {
-        if best.as_ref().is_none_or(|(b, _)| text.len() < b.len()) {
-            best = Some((text, state));
+    let mut text = Vec::new();
+    let state = transition_into(from, full_target, mask, style, &mut text);
+    let text = String::from_utf8(text).expect("SGR sequences are ASCII");
+    (text, state)
+}
+
+/// [`transition`], appending the text to `out`.
+pub(crate) fn transition_into(
+    from: &Pen,
+    full_target: &Pen,
+    mask: Mask,
+    style: Style,
+    out: &mut Vec<u8>,
+) -> Pen {
+    // Candidates are measured rather than written; only the winner is.
+    let mut best: Option<(usize, Codes, bool, Pen)> = None;
+    let mut consider = |codes: Codes, reset: bool, state: Pen| {
+        let mut len = Measure(0);
+        write_codes(codes.as_slice(), reset, style, &mut len);
+        if best.as_ref().is_none_or(|(b, ..)| len.0 < *b) {
+            best = Some((len.0, codes, reset, state));
         }
     };
 
@@ -547,9 +697,7 @@ pub fn transition(from: &Pen, full_target: &Pen, mask: Mask, style: Style) -> (S
     };
     for target in targets {
         if let Some(codes) = diff_codes(from, target) {
-            let mut text = String::new();
-            write_codes(&codes, false, style, &mut text);
-            consider(text, *target);
+            consider(codes, false, *target);
         }
         if full_target.is_known() {
             // After a reset, fields outside the mask may as well stay at
@@ -557,12 +705,13 @@ pub fn transition(from: &Pen, full_target: &Pen, mask: Mask, style: Style) -> (S
             let mut reset_target = Pen::DEFAULT;
             reset_target.copy_from(target, if target == full_target { ALL } else { mask });
             let codes = diff_codes(&Pen::DEFAULT, &reset_target).expect("default is known");
-            let mut text = String::new();
-            write_codes(&codes, true, style, &mut text);
-            consider(text, reset_target);
+            consider(codes, true, reset_target);
         }
     }
-    best.expect("the diff to the full target only fails when a reset is allowed")
+    let (_, codes, reset, state) =
+        best.expect("the diff to the full target only fails when a reset is allowed");
+    write_codes(codes.as_slice(), reset, style, out);
+    state
 }
 
 #[cfg(test)]

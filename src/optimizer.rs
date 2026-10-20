@@ -370,12 +370,21 @@ impl Minifier {
     pub fn feed(&mut self, input: &[u8]) -> Vec<u8> {
         self.pending.extend_from_slice(input);
         let data = std::mem::take(&mut self.pending);
+        // The output is rarely longer than the input.
+        self.out.reserve(data.len());
         let mut tokens = Vec::new();
         let mut pos = 0;
         while pos < data.len() {
             match lexer::scan(&data[pos..], false) {
                 Scan::Token(token, len) => {
-                    tokens.push(token);
+                    // Only visual mode looks ahead at later tokens (see
+                    // `process_all`); otherwise each token is processed as
+                    // soon as it is scanned.
+                    if self.opts.visual {
+                        tokens.push(token);
+                    } else {
+                        self.process_token(token, false);
+                    }
                     pos += len;
                 }
                 Scan::NeedMore => break,
@@ -444,19 +453,25 @@ impl Minifier {
             };
         }
         for (&token, follows) in tokens.iter().zip(base_follows) {
-            self.base_follows = follows;
-            if let Some(t) = &mut self.trace {
-                let raw = token.raw();
-                t.cur = t.entries.len();
-                t.entries.push(Entry {
-                    input: t.pos..t.pos + raw.len(),
-                    fate: Fate::Pending,
-                });
-                t.pos += raw.len();
-                t.input.extend_from_slice(raw);
-            }
-            self.process(token);
+            self.process_token(token, follows);
         }
+    }
+
+    /// Processes one token, recording it when tracing. `base_follows` says
+    /// whether the next character printed is known not to combine.
+    fn process_token(&mut self, token: Token, base_follows: bool) {
+        self.base_follows = base_follows;
+        if let Some(t) = &mut self.trace {
+            let raw = token.raw();
+            t.cur = t.entries.len();
+            t.entries.push(Entry {
+                input: t.pos..t.pos + raw.len(),
+                fate: Fate::Pending,
+            });
+            t.pos += raw.len();
+            t.input.extend_from_slice(raw);
+        }
+        self.process(token);
     }
 
     fn process(&mut self, token: Token) {
@@ -485,11 +500,17 @@ impl Minifier {
 
     /// Writes bytes, returning where they landed in the whole output.
     fn write(&mut self, bytes: &[u8]) -> Range<usize> {
+        self.write_with(|out| out.extend_from_slice(bytes)).0
+    }
+
+    /// Lets `f` append to the output, returning where its bytes landed in
+    /// the whole output along with what `f` returned.
+    fn write_with<T>(&mut self, f: impl FnOnce(&mut Vec<u8>) -> T) -> (Range<usize>, T) {
         self.flush_text();
         let base = self.trace.as_ref().map_or(0, |t| t.out_base);
-        let start = base + self.out.len();
-        self.out.extend_from_slice(bytes);
-        start..start + bytes.len()
+        let start = self.out.len();
+        let value = f(&mut self.out);
+        (base + start..base + self.out.len(), value)
     }
 
     /// Records the fate of the current token.
@@ -536,12 +557,13 @@ impl Minifier {
         if self.text.is_empty() {
             return;
         }
-        let text = std::mem::take(&mut self.text);
         if self.opts.rep {
-            write_with_rep(&text, &mut self.out);
+            write_with_rep(&self.text, &mut self.out);
         } else {
-            self.out.extend_from_slice(text.as_bytes());
+            self.out.extend_from_slice(self.text.as_bytes());
         }
+        // Clearing keeps the allocation for the next run of text.
+        self.text.clear();
     }
 
     /// Writes pending cursor movements and mode changes.
@@ -591,9 +613,9 @@ impl Minifier {
                 empty_reset: !self.opts.compat,
                 max_params: self.max_params,
             };
-            let (text, state) =
-                sgr::transition(&self.emitted.pen, &self.desired.pen, pen_mask, style);
-            let range = self.write(text.as_bytes());
+            let (from, to) = (self.emitted.pen, self.desired.pen);
+            let (range, state) =
+                self.write_with(|out| sgr::transition_into(&from, &to, pen_mask, style, out));
             if let Some(t) = &mut self.trace {
                 Tracer::written(&mut t.pen, range);
             }

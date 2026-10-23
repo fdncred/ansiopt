@@ -72,7 +72,11 @@ pub fn heat_bin(bytes: usize) -> Option<usize> {
 }
 
 fn heat(paint: Paint, bytes: usize, s: &str) -> String {
-    match heat_bin(bytes) {
+    heat_of_bin(paint, heat_bin(bytes), s)
+}
+
+fn heat_of_bin(paint: Paint, bin: Option<usize>, s: &str) -> String {
+    match bin {
         Some(bin) if paint.color => {
             let (r, g, b) = HEAT[bin];
             let ink = if bin >= 3 { "255;255;255" } else { "11;11;11" };
@@ -336,20 +340,34 @@ pub fn hotspot(report: &Report, paint: Paint) -> String {
             thousands(line.input()),
             thousands(line.output())
         );
-        // Each run of text is shaded by the bytes spent before it.
-        let mut current = 0;
-        for cell in &line.cells {
-            if cell.input > 0 || cell.output > 0 {
-                current = cell.input;
-            }
-            out.push_str(&heat(paint, current, &cell.ch.to_string()));
-        }
-        if line.end_input > 0 {
-            out.push_str(&heat(paint, line.end_input, "⏎"));
-        }
+        out.push_str(&shade(line, paint));
         out.push('\n');
     }
     out
+}
+
+/// A line of the heat map: each run of text shaded by how many escape bytes
+/// the input spent right before it, and `⏎` for bytes spent at the end of
+/// the line. Characters that fall in the same heat bin share one sequence.
+pub fn shade(line: &HeatLine, paint: Paint) -> String {
+    let mut runs: Vec<(Option<usize>, String)> = Vec::new();
+    let mut push = |bin: Option<usize>, ch: char| match runs.last_mut() {
+        Some((last, text)) if *last == bin => text.push(ch),
+        _ => runs.push((bin, ch.to_string())),
+    };
+    let mut spent = 0;
+    for cell in &line.cells {
+        if cell.input > 0 || cell.output > 0 {
+            spent = cell.input;
+        }
+        push(heat_bin(spent), cell.ch);
+    }
+    if line.end_input > 0 {
+        push(heat_bin(line.end_input), '⏎');
+    }
+    runs.iter()
+        .map(|(bin, text)| heat_of_bin(paint, *bin, text))
+        .collect()
 }
 
 #[cfg(test)]
@@ -385,5 +403,19 @@ mod tests {
         let text = hotspot(&report, PLAIN);
         assert!(text.contains("      8       7 │ ab"), "{text}");
         assert!(text.contains("      0       0 │ cd"), "{text}");
+    }
+
+    #[test]
+    fn shade_colors_runs() {
+        let input = b"\x1b[31mab\x1b[0mc\x1b[1m\n";
+        let output = b"\x1b[31mab\x1b[mc\x1b[1m\n";
+        let report = Report::new(input, output, false, None).unwrap();
+        let line = &heat_lines(&report)[0];
+        assert_eq!(shade(line, PLAIN), "abc⏎");
+        assert_eq!(
+            shade(line, Paint { color: true }),
+            "\x1b[48;2;158;197;244;38;2;11;11;11mab\x1b[m\
+             \x1b[48;2;205;226;251;38;2;11;11;11mc⏎\x1b[m"
+        );
     }
 }

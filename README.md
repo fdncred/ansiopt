@@ -129,8 +129,8 @@ outcome. Sequences written unchanged are counted but only listed with
 | folded into `X` | A color, hyperlink or character set change, written later as part of `X` once text needed it. Several input sequences often fold into one. |
 | merged into `X` | Combined with neighboring cursor movements or mode changes into `X`. |
 | rewritten as `X` | The same sequence, spelled shorter. |
-| no effect | Changed nothing by the time it mattered, like setting the color that was already in use. |
-| dropped | Made pointless by something later: a movement followed by an absolute move, a mode changed again before it mattered, a full reset. |
+| no effect | Changed nothing by the time it mattered, like setting the color that was already in use, or a color that was changed back before any text used it. |
+| dropped | Made pointless by something later: a color or style set again before any text used it, a movement followed by an absolute move, a mode changed again before it mattered, a full reset. |
 | barrier | Copied as is. ansiopt writes all pending state out first and stops assuming what the sequence might change. |
 | kept | Written unchanged. |
 

@@ -139,6 +139,156 @@ fn trace_covers_every_token() {
     }
 }
 
+/// A color or style change is only folded into the output when something
+/// written needed it; otherwise its fate says why it was left out.
+#[test]
+fn color_changes_say_why_they_were_left_out() {
+    let outcomes = |input: &str, options: &Options| -> Vec<String> {
+        let trace = ansiopt::minify_detailed(input.as_bytes(), options, true)
+            .trace
+            .expect("trace requested");
+        trace
+            .entries
+            .iter()
+            .filter(|e| e.fate != Fate::Text)
+            .map(|e| match &e.fate {
+                Fate::NoEffect { why } => format!("no effect: {why}"),
+                Fate::Superseded { why } => format!("dropped: {why}"),
+                fate => fate.kind().to_string(),
+            })
+            .collect()
+    };
+    let default = Options::default();
+    let already = "no effect: already in effect";
+    let again = "dropped: set again before it mattered";
+    let undone = "no effect: changed nothing by the time it mattered";
+    let cases: [(&str, &Options, &[&str]); 9] = [
+        // The second reset finds everything reset already.
+        (
+            "\x1b[0m\x1b[0m\x1b[31mhi\x1b[0m",
+            &default,
+            &["folded", already, "folded", "folded"],
+        ),
+        (
+            "\x1b[0m\x1b[0m\x1b[31mhi\x1b[0m",
+            &Options {
+                assume_reset: true,
+                ..Options::default()
+            },
+            &[already, already, "folded", "folded"],
+        ),
+        // The reset already made the background the default, and the second
+        // reset only cleared a foreground that the next sequence sets again.
+        (
+            "\x1b[0m\x1b[38;5;8m\x1b[49m 1 \x1b[0m\x1b[48;5;0;38;5;7m 25 ",
+            &default,
+            &["folded", "folded", already, again, "folded"],
+        ),
+        ("\x1b[31m\x1b[32mx", &default, &[again, "folded"]),
+        // The repeat finds red in effect, so the first one keeps the credit.
+        ("\x1b[31m\x1b[31mx", &default, &["folded", already]),
+        // The reset turns off reverse and italic again, and is needed anyway
+        // for everything else.
+        (
+            "\x1b[27m\x1b[23m\x1b[mx",
+            &default,
+            &[again, again, "folded"],
+        ),
+        // Faint adds to bold instead of replacing it.
+        ("\x1b[1m\x1b[2mx", &default, &["folded", "folded"]),
+        // Green is set back to the red the terminal already has.
+        (
+            "\x1b[31mx\x1b[32m\x1b[31m\x1b[1my",
+            &default,
+            &["folded", again, undone, "folded"],
+        ),
+        // The red background is written for the space before green replaces
+        // it.
+        (
+            "\x1b[0mA\x1b[41m \x1b[42mx",
+            &Options {
+                visual: true,
+                ..Options::default()
+            },
+            &["folded", "folded", "folded"],
+        ),
+    ];
+    for (input, options, expected) in cases {
+        assert_eq!(
+            outcomes(input, options),
+            expected,
+            "{}",
+            escape(input.as_bytes())
+        );
+    }
+}
+
+/// A color or style sequence that the trace calls already in effect, or set
+/// again before it mattered, can be deleted from the input without
+/// changing the output. The outputs compared are the optimizer's own, since
+/// a shorter input may make `minify` fall back to it.
+#[test]
+fn colors_left_out_can_be_deleted() {
+    let optimize = |input: &[u8], options: Options| {
+        let mut minifier = ansiopt::Minifier::new(options);
+        let mut output = minifier.feed(input);
+        output.extend(minifier.finish());
+        output
+    };
+    let is_sgr = |raw: &[u8]| {
+        let params = raw
+            .strip_prefix(b"\x1b[")
+            .or_else(|| raw.strip_prefix("\u{9b}".as_bytes()))
+            .and_then(|rest| rest.strip_suffix(b"m"));
+        params.is_some_and(|p| p.iter().all(|b| b"0123456789;:".contains(b)))
+    };
+    let params = |raw: &[u8]| raw.iter().filter(|&&b| b == b';').count() + 1;
+    let mut rng = Rng(seed(33));
+    for _ in 0..iterations() / 4 {
+        let input = gen_stream(&mut rng, 40);
+        for (name, options) in option_sets() {
+            let mut minifier = ansiopt::Minifier::with_trace(options);
+            let mut output = minifier.feed(&input);
+            let (rest, trace) = minifier.finish_traced();
+            output.extend(rest);
+            let trace = trace.expect("trace requested");
+            // Written sequences have at most as many parameters as the option
+            // allows or the longest SGR so far has, so deleting one longer
+            // than that may change how later ones are written.
+            let mut cap = options.max_params.max(1);
+            for entry in &trace.entries {
+                let raw = &input[entry.input.clone()];
+                if !is_sgr(raw) {
+                    continue;
+                }
+                let longer = params(raw) > cap;
+                cap = cap.max(params(raw));
+                let left_out = matches!(
+                    entry.fate,
+                    Fate::NoEffect {
+                        why: "already in effect"
+                    } | Fate::Superseded {
+                        why: "set again before it mattered"
+                    }
+                );
+                if !left_out || longer {
+                    continue;
+                }
+                let mut without = input.clone();
+                without.drain(entry.input.clone());
+                assert_eq!(
+                    escape(&optimize(&without, options)),
+                    escape(&output),
+                    "{name}: deleting {} at {} changed the output\ninput: {}",
+                    escape(raw),
+                    entry.input.start,
+                    escape(&input)
+                );
+            }
+        }
+    }
+}
+
 /// Every view works on real captures, and the HTML preview confirms the
 /// output draws the same screen.
 #[test]

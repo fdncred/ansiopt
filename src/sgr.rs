@@ -230,6 +230,25 @@ impl Pen {
             FRAME => frame, OVERLINE => overline, SCRIPT => script, FG => fg, BG => bg);
     }
 
+    /// The fields that differ between `self` and `other`.
+    pub(crate) fn differs(&self, other: &Pen) -> Mask {
+        let mut mask = 0;
+        if !self.intensity.eq_effective(&other.intensity) {
+            mask |= INTENSITY;
+        }
+        macro_rules! differ {
+            ($($bit:ident => $field:ident),*) => {$(
+                if self.$field != other.$field {
+                    mask |= $bit;
+                }
+            )*};
+        }
+        differ!(ITALIC => italic, UNDERLINE => underline, BLINK => blink, INVERSE => inverse,
+            HIDDEN => hidden, STRIKE => strike, FONT => font, PROPORTIONAL => proportional,
+            FRAME => frame, OVERLINE => overline, SCRIPT => script, FG => fg, BG => bg);
+        mask
+    }
+
     /// Keeps the fields that equal `other` and marks the rest unknown. Used
     /// after operations that may or may not have replaced the pen with
     /// `other`.

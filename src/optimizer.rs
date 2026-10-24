@@ -238,13 +238,49 @@ impl Move {
     }
 }
 
+/// Number of pen fields, one per bit of [`PEN`].
+const PEN_FIELDS: usize = PEN.count_ones() as usize;
+
+/// A deferred change waiting to be written.
+#[derive(Debug)]
+struct Pending {
+    /// Its trace entry.
+    entry: usize,
+    /// The fields it changed.
+    changed: u32,
+    /// The fields it changed that no later sequence has set again.
+    remaining: u32,
+    /// True once output was written for one of the fields it changed.
+    used: bool,
+}
+
+impl Pending {
+    /// A hyperlink or character set change. These aren't tracked field by
+    /// field, so the change counts as used once anything is written for its
+    /// kind of state.
+    fn whole(entry: usize, kind: u32) -> Self {
+        Pending {
+            entry,
+            changed: kind,
+            remaining: kind,
+            used: true,
+        }
+    }
+}
+
 /// Deferred changes of one kind of state, waiting to be written.
 #[derive(Debug, Default)]
 struct Deferred {
-    /// Trace entries whose change hasn't been resolved yet.
-    entries: Vec<usize>,
+    /// Changes that haven't been resolved yet.
+    entries: Vec<Pending>,
     /// Output written for this kind of state since the oldest of them.
     outputs: Vec<Range<usize>>,
+    /// For each pen field, the changes to it (indexes into `entries`) that
+    /// nothing has set again or written yet. Empty for the other kinds.
+    holders: [Vec<usize>; PEN_FIELDS],
+    /// For each pen field, later sequences that set it outright to the value
+    /// its holders gave it, so either could account for that value.
+    stand_ins: [Vec<usize>; PEN_FIELDS],
 }
 
 /// Records what happens to each token, for `--explain`.
@@ -273,36 +309,111 @@ impl Tracer {
         &self.input[self.entries[entry].input.clone()]
     }
 
-    /// Settles deferred changes: folded into what was written for them, or
-    /// without effect when nothing was.
-    fn resolve(deferred: &mut Deferred, entries: &mut [Entry]) {
-        for &e in &deferred.entries {
-            entries[e].fate = if deferred.outputs.is_empty() {
-                Fate::NoEffect {
-                    why: "changed nothing by the time it mattered",
+    /// Defers the current SGR's change to the pen. `changed` names the fields
+    /// it changed and `outright` the ones it sets whatever they were, which
+    /// hides earlier changes to them; `ESC[2m` after `ESC[1m` adds faint to
+    /// bold instead. Setting a field outright to the value it already has,
+    /// like a reset after `ESC[27m`, makes the sequence a stand-in for the
+    /// field's holders.
+    fn defer_pen(&mut self, changed: u32, outright: u32) {
+        let deferred = &mut self.pen;
+        let index = deferred.entries.len();
+        for bit in 0..PEN_FIELDS {
+            let field = 1 << bit;
+            let holders = &mut deferred.holders[bit];
+            if changed & field != 0 {
+                if outright & field != 0 {
+                    for &h in holders.iter() {
+                        deferred.entries[h].remaining &= !field;
+                    }
+                    holders.clear();
                 }
-            } else {
+                holders.push(index);
+                deferred.stand_ins[bit].clear();
+            } else if outright & field != 0 && !holders.is_empty() {
+                deferred.stand_ins[bit].push(index);
+            }
+        }
+        deferred.entries.push(Pending {
+            entry: self.cur,
+            changed,
+            remaining: changed,
+            used: false,
+        });
+    }
+
+    /// Settles deferred changes: folded into what was written for them, or
+    /// left out, saying why.
+    fn resolve(deferred: &mut Deferred, entries: &mut [Entry]) {
+        for pending in &deferred.entries {
+            entries[pending.entry].fate = if pending.used && !deferred.outputs.is_empty() {
                 Fate::Folded {
                     outputs: deferred.outputs.clone(),
                 }
+            } else if pending.changed == 0 {
+                Fate::NoEffect {
+                    why: "already in effect",
+                }
+            } else if pending.remaining == 0 {
+                Fate::Superseded {
+                    why: "set again before it mattered",
+                }
+            } else {
+                Fate::NoEffect {
+                    why: "changed nothing by the time it mattered",
+                }
             };
         }
-        deferred.entries.clear();
-        deferred.outputs.clear();
+        Tracer::clear(deferred);
     }
 
-    fn written(deferred: &mut Deferred, range: Range<usize>) {
-        if !deferred.entries.is_empty() {
-            deferred.outputs.push(range);
+    /// Records output written for this kind of state, which changed the pen
+    /// `fields` (none for the other kinds). The holders of each field are
+    /// used, unless a stand-in that is used anyway accounts for its value;
+    /// fields without stand-ins go first, so that is known.
+    fn written(deferred: &mut Deferred, range: Range<usize>, fields: u32) {
+        if deferred.entries.is_empty() {
+            return;
+        }
+        deferred.outputs.push(range);
+        let Deferred {
+            entries,
+            holders,
+            stand_ins,
+            ..
+        } = deferred;
+        for with_stand_ins in [false, true] {
+            for bit in 0..PEN_FIELDS {
+                let field = 1 << bit;
+                if fields & field == 0 || stand_ins[bit].is_empty() == with_stand_ins {
+                    continue;
+                }
+                let stood_in = !holders[bit].iter().any(|&h| entries[h].used)
+                    && stand_ins[bit].iter().any(|&s| entries[s].used);
+                for h in holders[bit].drain(..) {
+                    if stood_in {
+                        entries[h].remaining &= !field;
+                    } else {
+                        entries[h].used = true;
+                    }
+                }
+                stand_ins[bit].clear();
+            }
         }
     }
 
     fn wipe(deferred: &mut Deferred, entries: &mut [Entry], why: &'static str) {
-        for &e in &deferred.entries {
-            entries[e].fate = Fate::Superseded { why };
+        for pending in &deferred.entries {
+            entries[pending.entry].fate = Fate::Superseded { why };
         }
+        Tracer::clear(deferred);
+    }
+
+    fn clear(deferred: &mut Deferred) {
         deferred.entries.clear();
         deferred.outputs.clear();
+        deferred.holders.iter_mut().for_each(Vec::clear);
+        deferred.stand_ins.iter_mut().for_each(Vec::clear);
     }
 }
 
@@ -584,15 +695,13 @@ impl Minifier {
         }
     }
 
-    /// Defers the current token's change to the pen, hyperlink or
-    /// character sets.
+    /// Defers the current token's change to the hyperlink or character sets.
     fn defer(&mut self, which: u32) {
         if let Some(t) = &mut self.trace {
-            let cur = t.cur;
+            let pending = Pending::whole(t.cur, which);
             match which {
-                LINK => t.link.entries.push(cur),
-                CHARSET => t.charset.entries.push(cur),
-                _ => t.pen.entries.push(cur),
+                LINK => t.link.entries.push(pending),
+                _ => t.charset.entries.push(pending),
             }
         }
     }
@@ -676,7 +785,7 @@ impl Minifier {
             let (range, state) =
                 self.write_with(|out| sgr::transition_into(&from, &to, pen_mask, style, out));
             if let Some(t) = &mut self.trace {
-                Tracer::written(&mut t.pen, range);
+                Tracer::written(&mut t.pen, range, from.differs(&to) & pen_mask);
             }
             self.emitted.pen = state;
         }
@@ -696,7 +805,7 @@ impl Minifier {
                     out.extend_from_slice(terminator);
                 });
                 if let Some(t) = &mut self.trace {
-                    Tracer::written(&mut t.link, range);
+                    Tracer::written(&mut t.link, range, 0);
                 }
                 self.emitted.link = Some(link);
             }
@@ -745,7 +854,7 @@ impl Minifier {
             }
         });
         if let Some(t) = &mut self.trace {
-            Tracer::written(&mut t.charset, range);
+            Tracer::written(&mut t.charset, range, 0);
         }
         self.emitted.charsets = desired;
     }
@@ -1010,8 +1119,18 @@ impl Minifier {
         self.max_params = self.max_params.max(count);
         let mut pen = self.desired.pen;
         if pen.apply(c.params) {
+            if let Some(t) = &mut self.trace {
+                // The fields this sequence sets outright come out the same
+                // when it is applied to an unknown pen.
+                let mut alone = Pen::UNKNOWN;
+                let outright = if alone.apply(c.params) {
+                    PEN & !alone.differs(&pen)
+                } else {
+                    0
+                };
+                t.defer_pen(self.desired.pen.differs(&pen), outright);
+            }
             self.desired.pen = pen;
-            self.defer(PEN);
         } else {
             self.barrier_token(
                 c.raw,

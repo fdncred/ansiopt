@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0 (2026-10-24)
+
+`--explain` says why each color or style sequence was left out, where it used to list every sequence before the next text as folded into what was written for it. The output is byte for byte what 0.3.1 writes, and the public API is unchanged, but for the same input `--explain`, `--html` and `Trace` report different fates for SGR sequences.
+
+- A color or style sequence is folded only when something written needed it.
+- One that only set what was already in effect has no effect: "already in effect", like a second reset.
+- One whose changes were all set again before any text used them is dropped: "set again before it mattered". That includes a reset after `ESC[27m`, which turns reverse off again while doing more.
+- One whose change was put back before anything used it has no effect: "changed nothing by the time it mattered".
+
 ## 0.3.1 (2026-10-22)
 
 - Adds `report::term::shade`, which shades one line of the heat map, so a program showing ansiopt's hotspot view draws the same colors as `--hotspot`.
